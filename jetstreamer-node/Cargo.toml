@@ -47,6 +47,7 @@ solana-logger.workspace = true
 solana-pubkey.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
+solana-unified-scheduler-pool.workspace = true
 solana-signature.workspace = true
 solana-entry.workspace = true
 solana-transaction.workspace = true

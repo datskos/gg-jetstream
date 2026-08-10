@@ -58,6 +58,7 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
+use solana_runtime::prioritization_fee_cache::PrioritizationFeeCache;
 use solana_runtime::{
     bank::Bank, bank_forks::BankForks, installed_scheduler_pool::BankWithScheduler,
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
@@ -76,6 +77,7 @@ use solana_transaction::{
     versioned::VersionedTransaction,
 };
 use solana_transaction_status::TransactionStatusMeta;
+use solana_unified_scheduler_pool::DefaultSchedulerPool;
 use tar::Archive as TarArchive;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
@@ -330,6 +332,43 @@ impl SnapshotVerifier {
     }
 }
 
+/// Which executor drives slot replay (`JETSTREAMER_SCHEDULER`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SchedulerMode {
+    /// Agave's unified scheduler: per-transaction dependency scheduling with
+    /// no round barriers ([`BankReplay::replay_slot_unified`]).
+    Unified,
+    /// Whole-slot parallel round scheduler ([`BankReplay::replay_slot_rounds`]).
+    Rounds,
+    /// Legacy wave walk ([`BankReplay::replay_slot_waves`]).
+    Waves,
+}
+
+fn scheduler_mode_from_env() -> SchedulerMode {
+    match env::var("JETSTREAMER_SCHEDULER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "unified" => SchedulerMode::Unified,
+        "rounds" => SchedulerMode::Rounds,
+        "waves" => SchedulerMode::Waves,
+        "" => {
+            // Back-compat with the previous toggle: =0 selected the wave walk.
+            if env_truthy_default("JETSTREAMER_PARALLEL_SCHEDULER", true) {
+                SchedulerMode::Rounds
+            } else {
+                SchedulerMode::Waves
+            }
+        }
+        other => {
+            warn!("unknown JETSTREAMER_SCHEDULER '{other}'; using rounds");
+            SchedulerMode::Rounds
+        }
+    }
+}
+
 struct BankReplay {
     bank_forks: Arc<RwLock<BankForks>>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
@@ -352,9 +391,8 @@ struct BankReplay {
     /// Pool for executing mutually non-conflicting entry batches in
     /// parallel (see [`BankReplay::process_slot_entries`]).
     replay_pool: rayon::ThreadPool,
-    /// When set, use the whole-slot parallel round scheduler
-    /// ([`BankReplay::replay_slot_rounds`]); otherwise the legacy wave walk.
-    parallel_scheduler: bool,
+    /// Which slot executor to use (see [`SchedulerMode`]).
+    scheduler_mode: SchedulerMode,
 }
 
 /// The account footprint of one entry (the union across its transactions):
@@ -600,15 +638,27 @@ impl BankReplay {
             .ok()
             .and_then(|value| Signature::from_str(value.trim()).ok());
         let replay_threads = replay_thread_count();
-        let parallel_scheduler = env_truthy_default("JETSTREAMER_PARALLEL_SCHEDULER", true);
+        let scheduler_mode = scheduler_mode_from_env();
         info!(
-            "replay execution threads: {replay_threads}; scheduler: {} (set JETSTREAMER_PARALLEL_SCHEDULER=0 for legacy waves)",
-            if parallel_scheduler {
-                "parallel rounds"
-            } else {
-                "legacy waves"
-            }
+            "replay execution threads: {replay_threads}; scheduler: {scheduler_mode:?} \
+             (JETSTREAMER_SCHEDULER=unified|rounds|waves)"
         );
+        if scheduler_mode == SchedulerMode::Unified {
+            // Handler threads execute and commit; completions land in the
+            // status cache (read back for expected-status verification), and
+            // account updates reach the horizon recorder through the
+            // signature-attributed fallback path in `note_account_update`.
+            bank_forks
+                .write()
+                .expect("bank forks lock poisoned")
+                .install_scheduler_pool(DefaultSchedulerPool::new_dyn(
+                    Some(replay_threads),
+                    None,
+                    None,
+                    None,
+                    Arc::new(PrioritizationFeeCache::default()),
+                ));
+        }
         let replay_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(replay_threads)
             .thread_name(|i| format!("replayExec{i:02}"))
@@ -635,7 +685,7 @@ impl BankReplay {
             enable_accounts_maintenance,
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
             replay_pool,
-            parallel_scheduler,
+            scheduler_mode,
         }
     }
 
@@ -1534,13 +1584,11 @@ impl BankReplay {
         PHASE_SANITIZE_US.fetch_add(sanitize_us, Ordering::Relaxed);
         PHASE_PREPARE_BATCH_US.fetch_add(sanitize_us, Ordering::Relaxed);
 
-        // Phase 2: execute the slot's transactions. Two schedulers:
-        // `replay_slot_rounds` (parallel, whole-slot conflict-respecting
-        // level assignment) when enabled, else the legacy wave walk.
-        if self.parallel_scheduler {
-            self.replay_slot_rounds(&bank, group, sanitized);
-        } else {
-            self.replay_slot_waves(&bank, group, sanitized);
+        // Phase 2: execute the slot's transactions.
+        match self.scheduler_mode {
+            SchedulerMode::Unified => self.replay_slot_unified(&bank, group, sanitized),
+            SchedulerMode::Rounds => self.replay_slot_rounds(&bank, group, sanitized),
+            SchedulerMode::Waves => self.replay_slot_waves(&bank, group, sanitized),
         }
     }
 
@@ -1794,6 +1842,132 @@ impl BankReplay {
                 recorder.record_captured_updates(std::mem::take(&mut captured[pos]));
             }
             self.post_process_entry(bank, entry, entry_results, slot_exec);
+        }
+    }
+
+    /// Unified-scheduler execution: submits every transaction entry to the
+    /// bank's installed Agave scheduler (per-transaction dependency
+    /// scheduling — no round barriers, so one long conflict chain no longer
+    /// stalls unrelated transactions), waits for the slot to complete, then
+    /// performs side effects in strict entry order. Task ids are the
+    /// slot-global transaction indexes, which preserves per-account
+    /// commit order across entries. Account updates reach the horizon
+    /// recorder during commit via `note_account_update`'s
+    /// signature-attributed fallback path; per-transaction statuses are read
+    /// back from the bank's status cache for expected-status verification.
+    fn replay_slot_unified(
+        &self,
+        bank: &Arc<Bank>,
+        group: Vec<ReadyEntry>,
+        mut sanitized: Vec<Vec<RuntimeTransaction<SanitizedTransaction>>>,
+    ) {
+        let Some(first) = group.first() else {
+            return;
+        };
+        let slot = first.slot;
+        let Some(bank_ws) = self
+            .bank_forks
+            .read()
+            .expect("bank forks lock poisoned")
+            .get_with_scheduler(slot)
+        else {
+            let message = format!("unified scheduler: no bank for slot {slot} in bank forks");
+            self.failure.record(message.clone());
+            panic!("{message}");
+        };
+        if !bank_ws.has_installed_scheduler() {
+            let message = format!(
+                "unified scheduler mode active but slot {slot}'s bank has no installed scheduler"
+            );
+            self.failure.record(message.clone());
+            panic!("{message}");
+        }
+
+        let signature = first
+            .txs
+            .first()
+            .and_then(|scheduled| scheduled.tx.signatures.first())
+            .map(|sig| sig.to_string());
+        self.cursor.start_inflight(
+            slot,
+            first.entry_index,
+            first.start_index,
+            group.iter().map(|e| e.tx_count).sum(),
+            signature,
+        );
+        let _inflight_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+
+        self.cursor.update_inflight_stage("unified_submit");
+        let exec_start = Instant::now();
+        PHASE_WAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let mut submit_error = false;
+        for (pos, entry) in group.iter().enumerate() {
+            if entry.tx_count == 0 {
+                continue; // ticks register in order after completion
+            }
+            PHASE_WAVE_BATCHES.fetch_add(1, Ordering::Relaxed);
+            let txs = std::mem::take(&mut sanitized[pos]);
+            let base = entry.start_index as u128;
+            if bank_ws
+                .schedule_transaction_executions(
+                    txs.into_iter()
+                        .enumerate()
+                        .map(|(offset, tx)| (tx, base + offset as u128)),
+                )
+                .is_err()
+            {
+                // Scheduler aborted; the true error surfaces from the wait.
+                submit_error = true;
+                break;
+            }
+        }
+
+        self.cursor.update_inflight_stage("unified_wait");
+        let wait_result = bank_ws.wait_for_completed_scheduler();
+        let slot_exec = exec_start.elapsed();
+        PHASE_EXECUTE_US.fetch_add(slot_exec.as_micros() as u64, Ordering::Relaxed);
+        match wait_result {
+            Some((Ok(()), _timings)) => {}
+            Some((Err(err), _timings)) => {
+                let message = format!("unified scheduler failed in slot {slot}: {err:?}");
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+            None => {
+                let message = format!(
+                    "unified scheduler returned no result for slot {slot} \
+                     (submit_error={submit_error})"
+                );
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+        }
+
+        // Side effects in strict entry order: ticks register, transactions
+        // verify against expected statuses and notify.
+        for entry in group {
+            if entry.tx_count == 0 {
+                self.register_tick_entry(entry);
+                continue;
+            }
+            let results: Vec<Result<(), TransactionError>> = entry
+                .txs
+                .iter()
+                .map(|scheduled| {
+                    scheduled
+                        .tx
+                        .signatures
+                        .first()
+                        .and_then(|sig| bank.get_signature_status(sig))
+                        // Missing from the status cache after a clean wait
+                        // means the transaction never committed; surface it
+                        // through the mismatch machinery.
+                        .unwrap_or(Err(TransactionError::CommitCancelled))
+                })
+                .collect();
+            self.post_process_entry(bank, entry, results, slot_exec);
         }
     }
 

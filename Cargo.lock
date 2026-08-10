@@ -55,6 +55,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-banking-stage-ingress-types"
+version = "3.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b3fdacab2925394dc106b0b1086743685a37d9c69e3d013da603977b7b43a72"
+dependencies = [
+ "crossbeam-channel",
+ "solana-perf",
+]
+
+[[package]]
 name = "agave-feature-set"
 version = "3.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2255,6 +2265,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
+name = "convert_case"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2759,16 +2778,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-where"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "derive_more"
 version = "0.99.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6edb4b64a43d977b8e99788fe3a04d483834fba1215a7e02caa415b626497f7f"
 dependencies = [
- "convert_case",
+ "convert_case 0.4.0",
  "proc-macro2",
  "quote",
  "rustc_version 0.4.1",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "derive_more"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
+dependencies = [
+ "convert_case 0.10.0",
+ "proc-macro2",
+ "quote",
+ "rustc_version 0.4.1",
+ "syn 2.0.117",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -4684,6 +4737,7 @@ dependencies = [
  "solana-svm-timings",
  "solana-transaction",
  "solana-transaction-status",
+ "solana-unified-scheduler-pool",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -4868,7 +4922,7 @@ version = "18.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2b99d4207e2a04fb4581746903c2bb7eb376f88de9c699d0f3e10feeac0cd3a"
 dependencies = [
- "derive_more",
+ "derive_more 0.99.20",
  "futures 0.3.32",
  "jsonrpc-core",
  "jsonrpc-pubsub",
@@ -11126,6 +11180,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-unified-scheduler-pool"
+version = "3.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a46d633890bb0cfdf654ca64f0f4016dd41513d5fc56e99afebe51d396280b7"
+dependencies = [
+ "agave-banking-stage-ingress-types",
+ "aquamarine",
+ "assert_matches",
+ "crossbeam-channel",
+ "dashmap 5.5.3",
+ "derive-where",
+ "derive_more 2.1.1",
+ "dyn-clone",
+ "log",
+ "qualifier_attr",
+ "scopeguard",
+ "solana-clock",
+ "solana-cost-model",
+ "solana-ledger",
+ "solana-metrics",
+ "solana-poh",
+ "solana-pubkey 3.0.0",
+ "solana-runtime",
+ "solana-runtime-transaction",
+ "solana-svm",
+ "solana-svm-timings",
+ "solana-transaction",
+ "solana-transaction-error",
+ "solana-unified-scheduler-logic",
+ "static_assertions",
+ "trait-set",
+ "unwrap_none",
+ "vec_extract_if_polyfill",
+]
+
+[[package]]
 name = "solana-validator-exit"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12335,6 +12425,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trait-set"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79e2e9c9ab44c6d7c20d5976961b47e8f49ac199154daa514b77cd1ab536625"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "trees"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12579,6 +12680,12 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vec_extract_if_polyfill"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c9cb5fb67c2692310b6eb3fce7dd4b6e4c9a75be4f2f46b27f0b2b7799759c"
 
 [[package]]
 name = "vec_map"
