@@ -478,6 +478,20 @@ impl BankWithScheduler {
         Self::new(bank, None)
     }
 
+    /// Checks a block-verification scheduler out of `pool` for `bank` and
+    /// wraps the pair, for callers that manage scheduler checkout per slot
+    /// themselves instead of relying on `BankForks::insert`-time attachment
+    /// (jetstreamer's unified replay path). The scheduler returns to the pool
+    /// through the normal [`Self::wait_for_completed_scheduler`] path.
+    pub fn new_for_verification_replay(
+        bank: Arc<Bank>,
+        pool: &InstalledSchedulerPoolArc,
+    ) -> Self {
+        let context = SchedulingContext::for_verification(bank.clone());
+        let scheduler = pool.take_scheduler(context);
+        Self::new(bank, Some(scheduler))
+    }
+
     pub fn clone_with_scheduler(&self) -> BankWithScheduler {
         BankWithScheduler {
             inner: self.inner.clone(),

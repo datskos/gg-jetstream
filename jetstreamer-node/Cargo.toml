@@ -59,3 +59,6 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 xxhash-rust.workspace = true
+
+[dev-dependencies]
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }

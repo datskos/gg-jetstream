@@ -58,6 +58,7 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
+use solana_runtime::installed_scheduler_pool::InstalledSchedulerPoolArc;
 use solana_runtime::prioritization_fee_cache::PrioritizationFeeCache;
 use solana_runtime::{
     bank::Bank, bank_forks::BankForks, installed_scheduler_pool::BankWithScheduler,
@@ -393,6 +394,10 @@ struct BankReplay {
     replay_pool: rayon::ThreadPool,
     /// Which slot executor to use (see [`SchedulerMode`]).
     scheduler_mode: SchedulerMode,
+    /// Scheduler pool for [`SchedulerMode::Unified`]; schedulers are checked
+    /// out per slot in [`BankReplay::replay_slot_unified`] and returned by its
+    /// completion wait.
+    unified_pool: Option<InstalledSchedulerPoolArc>,
 }
 
 /// The account footprint of one entry (the union across its transactions):
@@ -643,22 +648,22 @@ impl BankReplay {
             "replay execution threads: {replay_threads}; scheduler: {scheduler_mode:?} \
              (JETSTREAMER_SCHEDULER=unified|rounds|waves)"
         );
-        if scheduler_mode == SchedulerMode::Unified {
-            // Handler threads execute and commit; completions land in the
-            // status cache (read back for expected-status verification), and
-            // account updates reach the horizon recorder through the
-            // signature-attributed fallback path in `note_account_update`.
-            bank_forks
-                .write()
-                .expect("bank forks lock poisoned")
-                .install_scheduler_pool(DefaultSchedulerPool::new_dyn(
-                    Some(replay_threads),
-                    None,
-                    None,
-                    None,
-                    Arc::new(PrioritizationFeeCache::default()),
-                ));
-        }
+        // Handler threads execute and commit; completions land in the status
+        // cache (read back for expected-status verification), and account
+        // updates reach the horizon recorder through the signature-attributed
+        // fallback path in `note_account_update`. Schedulers are checked out
+        // of the pool per slot rather than attached at bank insert, keeping
+        // bank-forks bookkeeping identical across all three modes.
+        let unified_pool = (scheduler_mode == SchedulerMode::Unified).then(|| {
+            info!("unified scheduler pool created (handlers={replay_threads})");
+            DefaultSchedulerPool::new_dyn(
+                Some(replay_threads),
+                None,
+                None,
+                None,
+                Arc::new(PrioritizationFeeCache::default()),
+            )
+        });
         let replay_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(replay_threads)
             .thread_name(|i| format!("replayExec{i:02}"))
@@ -686,6 +691,7 @@ impl BankReplay {
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
             replay_pool,
             scheduler_mode,
+            unified_pool,
         }
     }
 
@@ -1865,23 +1871,13 @@ impl BankReplay {
             return;
         };
         let slot = first.slot;
-        let Some(bank_ws) = self
-            .bank_forks
-            .read()
-            .expect("bank forks lock poisoned")
-            .get_with_scheduler(slot)
-        else {
-            let message = format!("unified scheduler: no bank for slot {slot} in bank forks");
+        let Some(pool) = self.unified_pool.as_ref() else {
+            let message =
+                format!("unified scheduler mode active but no scheduler pool exists (slot {slot})");
             self.failure.record(message.clone());
             panic!("{message}");
         };
-        if !bank_ws.has_installed_scheduler() {
-            let message = format!(
-                "unified scheduler mode active but slot {slot}'s bank has no installed scheduler"
-            );
-            self.failure.record(message.clone());
-            panic!("{message}");
-        }
+        let bank_ws = BankWithScheduler::new_for_verification_replay(bank.clone(), pool);
 
         let signature = first
             .txs
