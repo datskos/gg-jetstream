@@ -4,6 +4,12 @@ set -euo pipefail
 # Calculates the total size (in bytes) of all Old Faithful epoch CAR files
 # plus their compact indexes (slot-to-cid and cid-to-offset-and-size).
 # Uses HEAD requests from epoch 0 onward until a 404 is encountered.
+#
+# The CDN rate-limits aggressively, so every request retries with exponential
+# backoff (honoring Retry-After) instead of aborting on 429/5xx, and per-epoch
+# results are cached to CACHE_FILE so an interrupted run resumes where it
+# stopped. Set SKIP_INDEXES=1 to probe only CAR sizes (1 request per epoch
+# instead of 4) — index sizes are a rounding error (~5 MB vs ~700 GB).
 
 BASE_URL="${JETSTREAMER_HTTP_BASE_URL:-${JETSTREAMER_ARCHIVE_BASE:-https://files.old-faithful.net}}"
 BASE_URL="${BASE_URL%/}"
@@ -11,7 +17,11 @@ INDEX_BASE_URL="${JETSTREAMER_COMPACT_INDEX_BASE_URL:-${JETSTREAMER_ARCHIVE_BASE
 INDEX_BASE_URL="${INDEX_BASE_URL%/}"
 NETWORK="${JETSTREAMER_NETWORK:-mainnet}"
 START_EPOCH="${START_EPOCH:-0}"
-CONCURRENCY="${CONCURRENCY:-10}"
+CONCURRENCY="${CONCURRENCY:-4}"
+CACHE_FILE="${CACHE_FILE:-old-faithful-sizes.tsv}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"
+THROTTLE="${THROTTLE:-0.15}"
+SKIP_INDEXES="${SKIP_INDEXES:-0}"
 
 total_bytes=0
 epoch="$START_EPOCH"
@@ -20,6 +30,10 @@ printf "Base URL: %s\n" "$BASE_URL"
 printf "Index base URL: %s\n" "$INDEX_BASE_URL"
 printf "Network: %s\n" "$NETWORK"
 printf "Starting at epoch: %s\n" "$epoch"
+printf "Cache file: %s\n" "$CACHE_FILE"
+if [[ "$SKIP_INDEXES" == "1" ]]; then
+  printf "Index probing: skipped (CAR sizes only)\n"
+fi
 
 format_bytes() {
   awk -v b="$1" 'BEGIN{
@@ -30,25 +44,75 @@ format_bytes() {
   }'
 }
 
+# HEAD a URL with retries. Echoes "http_code<TAB>content_length" for terminal
+# codes (200/206/404); retries 429/5xx/transport errors with backoff, honoring
+# Retry-After. Returns 1 only after MAX_ATTEMPTS failures.
+curl_head() {
+  local url="$1" attempt=1 response http_code retry_after sleep_s cl
+  while :; do
+    retry_after=""
+    if response=$(curl -sS -I -L --max-time 60 -w "\n%{http_code}\n" "$url" 2>/dev/null); then
+      http_code=$(printf "%s" "$response" | tail -n 1 | tr -d '\r')
+      case "$http_code" in
+        200|206|404)
+          cl=$(printf "%s" "$response" | tr -d '\r' | awk 'tolower($1)=="content-length:" {val=$2} END{print val}')
+          printf "%s\t%s\n" "$http_code" "${cl:-0}"
+          return 0
+          ;;
+        429|5*)
+          retry_after=$(printf "%s" "$response" | tr -d '\r' | awk 'tolower($1)=="retry-after:" {print $2}' | tail -n 1)
+          ;;
+      esac
+    fi
+    if [[ "$attempt" -ge "$MAX_ATTEMPTS" ]]; then
+      return 1
+    fi
+    sleep_s=$((2 ** attempt))
+    [[ "$sleep_s" -gt 60 ]] && sleep_s=60
+    if [[ -n "${retry_after:-}" && "$retry_after" =~ ^[0-9]+$ ]]; then
+      sleep_s="$retry_after"
+    fi
+    sleep "$sleep_s"
+    attempt=$((attempt + 1))
+  done
+}
+
 get_root_base32() {
   local url="$1"
   python3 - "$url" <<'PY'
 import base64
 import sys
+import time
 import urllib.request
+from urllib.error import HTTPError
 
 url = sys.argv[1]
 
 def fetch_range(start, end):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Range": f"bytes={start}-{end}",
-            "User-Agent": "curl/8.6.0",
-        },
-    )
-    with urllib.request.urlopen(req) as resp:
-        return resp.read()
+    last_exc = None
+    for attempt in range(8):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Range": f"bytes={start}-{end}",
+                "User-Agent": "curl/8.6.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.read()
+        except HTTPError as exc:
+            last_exc = exc
+            if exc.code == 429 or exc.code >= 500:
+                ra = exc.headers.get("Retry-After") if exc.headers else None
+                delay = int(ra) if ra and ra.isdigit() else min(2 ** (attempt + 1), 60)
+                time.sleep(delay)
+                continue
+            raise
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(min(2 ** (attempt + 1), 60))
+    raise ValueError(f"range fetch failed after retries: {last_exc}")
 
 def read_varint(data, offset=0):
     value = 0
@@ -205,38 +269,27 @@ fetch_epoch_info() {
   local epoch="$1"
   local url="${BASE_URL}/${epoch}/epoch-${epoch}.car"
 
-  local response http_code content_length
-  if ! response=$(curl -sS -I -L -w "\n%{http_code}\n" "$url"); then
-    printf "curl failed for epoch %s (%s)\n" "$epoch" "$url" >&2
+  local head_result http_code content_length
+  if ! head_result=$(curl_head "$url"); then
+    printf "HEAD failed after %s attempts for epoch %s (%s)\n" "$MAX_ATTEMPTS" "$epoch" "$url" >&2
     return 1
   fi
-
-  http_code=$(printf "%s" "$response" | tail -n 1 | tr -d '\r')
+  http_code="${head_result%%$'\t'*}"
+  content_length="${head_result#*$'\t'}"
 
   if [[ "$http_code" == "404" ]]; then
     printf "notfound\t%s\n" "$epoch"
     return 2
   fi
 
-  if [[ "$http_code" != "200" && "$http_code" != "206" ]]; then
-    printf "Unexpected HTTP %s for epoch %s (%s). Aborting.\n" "$http_code" "$epoch" "$url" >&2
+  if [[ -z "$content_length" || ! "$content_length" =~ ^[0-9]+$ || "$content_length" == "0" ]]; then
+    printf "Missing/invalid Content-Length for epoch %s (%s). Aborting.\n" "$epoch" "$url" >&2
     return 1
   fi
 
-  content_length=$(
-    printf "%s" "$response" \
-      | tr -d '\r' \
-      | awk 'tolower($1)=="content-length:" {val=$2} END{print val}'
-  )
-
-  if [[ -z "$content_length" ]]; then
-    printf "Missing Content-Length for epoch %s (%s). Aborting.\n" "$epoch" "$url" >&2
-    return 1
-  fi
-
-  if ! [[ "$content_length" =~ ^[0-9]+$ ]]; then
-    printf "Non-numeric Content-Length (%s) for epoch %s. Aborting.\n" "$content_length" "$epoch" >&2
-    return 1
+  if [[ "$SKIP_INDEXES" == "1" ]]; then
+    printf "car\t%s\t%s\t0\t0\t0\t0\n" "$epoch" "$content_length"
+    return 0
   fi
 
   local root_base32
@@ -248,49 +301,33 @@ fetch_epoch_info() {
   local slot_index_url="${INDEX_BASE_URL}/${epoch}/epoch-${epoch}-${root_base32}-${NETWORK}-slot-to-cid.index"
   local cid_index_url="${INDEX_BASE_URL}/${epoch}/epoch-${epoch}-${root_base32}-${NETWORK}-cid-to-offset-and-size.index"
 
-  local slot_size=0
-  local slot_missing=0
-  if response=$(curl -sS -I -L -w "\n%{http_code}\n" "$slot_index_url"); then
-    local slot_code
-    slot_code=$(printf "%s" "$response" | tail -n 1 | tr -d '\r')
-    if [[ "$slot_code" == "200" || "$slot_code" == "206" ]]; then
-      slot_size=$(printf "%s" "$response" | tr -d '\r' | awk 'tolower($1)=="content-length:" {val=$2} END{print val}')
-      if [[ -z "$slot_size" || ! "$slot_size" =~ ^[0-9]+$ ]]; then
-        printf "Invalid Content-Length for slot index epoch %s (%s). Aborting.\n" "$epoch" "$slot_index_url" >&2
-        return 1
-      fi
-    elif [[ "$slot_code" == "404" ]]; then
-      slot_missing=1
-      slot_size=0
-    else
-      printf "Unexpected HTTP %s for slot index epoch %s (%s). Aborting.\n" "$slot_code" "$epoch" "$slot_index_url" >&2
-      return 1
-    fi
-  else
-    printf "curl failed for slot index epoch %s (%s)\n" "$epoch" "$slot_index_url" >&2
+  local slot_size=0 slot_missing=0 slot_code
+  if ! head_result=$(curl_head "$slot_index_url"); then
+    printf "HEAD failed after %s attempts for slot index epoch %s (%s)\n" "$MAX_ATTEMPTS" "$epoch" "$slot_index_url" >&2
+    return 1
+  fi
+  slot_code="${head_result%%$'\t'*}"
+  slot_size="${head_result#*$'\t'}"
+  if [[ "$slot_code" == "404" ]]; then
+    slot_missing=1
+    slot_size=0
+  elif [[ -z "$slot_size" || ! "$slot_size" =~ ^[0-9]+$ ]]; then
+    printf "Invalid Content-Length for slot index epoch %s (%s). Aborting.\n" "$epoch" "$slot_index_url" >&2
     return 1
   fi
 
-  local cid_size=0
-  local cid_missing=0
-  if response=$(curl -sS -I -L -w "\n%{http_code}\n" "$cid_index_url"); then
-    local cid_code
-    cid_code=$(printf "%s" "$response" | tail -n 1 | tr -d '\r')
-    if [[ "$cid_code" == "200" || "$cid_code" == "206" ]]; then
-      cid_size=$(printf "%s" "$response" | tr -d '\r' | awk 'tolower($1)=="content-length:" {val=$2} END{print val}')
-      if [[ -z "$cid_size" || ! "$cid_size" =~ ^[0-9]+$ ]]; then
-        printf "Invalid Content-Length for cid index epoch %s (%s). Aborting.\n" "$epoch" "$cid_index_url" >&2
-        return 1
-      fi
-    elif [[ "$cid_code" == "404" ]]; then
-      cid_missing=1
-      cid_size=0
-    else
-      printf "Unexpected HTTP %s for cid index epoch %s (%s). Aborting.\n" "$cid_code" "$epoch" "$cid_index_url" >&2
-      return 1
-    fi
-  else
-    printf "curl failed for cid index epoch %s (%s)\n" "$epoch" "$cid_index_url" >&2
+  local cid_size=0 cid_missing=0 cid_code
+  if ! head_result=$(curl_head "$cid_index_url"); then
+    printf "HEAD failed after %s attempts for cid index epoch %s (%s)\n" "$MAX_ATTEMPTS" "$epoch" "$cid_index_url" >&2
+    return 1
+  fi
+  cid_code="${head_result%%$'\t'*}"
+  cid_size="${head_result#*$'\t'}"
+  if [[ "$cid_code" == "404" ]]; then
+    cid_missing=1
+    cid_size=0
+  elif [[ -z "$cid_size" || ! "$cid_size" =~ ^[0-9]+$ ]]; then
+    printf "Invalid Content-Length for cid index epoch %s (%s). Aborting.\n" "$epoch" "$cid_index_url" >&2
     return 1
   fi
 
@@ -302,6 +339,15 @@ fetch_epoch_info() {
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+touch "$CACHE_FILE"
+
+cached_line_for() {
+  # Cached "ok" (full) and "car" (CAR-only) lines both count. The `|| true`
+  # matters: under pipefail, a non-matching grep would otherwise kill the
+  # script through the command-substitution assignment.
+  { grep -E "^(ok|car)	${1}	" "$CACHE_FILE" 2>/dev/null || true; } | tail -n 1
+}
+
 missing_epoch=""
 
 spawn_epoch() {
@@ -311,6 +357,38 @@ spawn_epoch() {
   pids+=("$!")
   epochs+=("$epoch")
   files+=("$outfile")
+  sleep "$THROTTLE"
+}
+
+process_line() {
+  local line="$1" from_cache="$2"
+  local tag epoch_val car_size slot_size cid_size slot_missing cid_missing
+  IFS=$'\t' read -r tag epoch_val car_size slot_size cid_size slot_missing cid_missing <<<"$line"
+  if [[ "$tag" != "ok" && "$tag" != "car" ]]; then
+    printf "Unexpected output for epoch %s. Aborting.\n" "$epoch_val" >&2
+    exit 1
+  fi
+
+  if [[ "$from_cache" != "1" ]]; then
+    printf "%s\n" "$line" >>"$CACHE_FILE"
+  fi
+
+  local epoch_total=$((car_size + slot_size + cid_size))
+  total_bytes=$((total_bytes + epoch_total))
+  local car_human epoch_human total_human cache_note=""
+  car_human=$(format_bytes "$car_size")
+  epoch_human=$(format_bytes "$epoch_total")
+  total_human=$(format_bytes "$total_bytes")
+  [[ "$from_cache" == "1" ]] && cache_note=" [cached]"
+  local slot_suffix="" cid_suffix=""
+  [[ "$slot_missing" == "1" ]] && slot_suffix=" (missing)"
+  [[ "$cid_missing" == "1" ]] && cid_suffix=" (missing)"
+  printf "Epoch %s: car=%s (%s), slot-index=%s%s, cid-index=%s%s, epoch total=%s (%s), running total=%s (%s)%s\n" \
+    "$epoch_val" "$car_size" "$car_human" \
+    "$slot_size" "$slot_suffix" \
+    "$cid_size" "$cid_suffix" \
+    "$epoch_total" "$epoch_human" \
+    "$total_bytes" "$total_human" "$cache_note"
 }
 
 while :; do
@@ -318,6 +396,12 @@ while :; do
   epochs=()
   files=()
   while [[ -z "$missing_epoch" && ${#pids[@]} -lt "$CONCURRENCY" ]]; do
+    cached=$(cached_line_for "$epoch")
+    if [[ -n "$cached" ]]; then
+      process_line "$cached" 1
+      epoch=$((epoch + 1))
+      continue
+    fi
     spawn_epoch "$epoch"
     epoch=$((epoch + 1))
   done
@@ -348,35 +432,14 @@ while :; do
         printf "Epoch %s not found (HTTP 404). Stopping after in-flight epochs complete.\n" "$epoch_i"
       fi
     elif [[ "$status" -ne 0 ]]; then
-      printf "Failed while fetching epoch %s. See errors above.\n" "$epoch_i" >&2
+      printf "Failed while fetching epoch %s (after retries). Progress is cached in %s; re-run to resume.\n" "$epoch_i" "$CACHE_FILE" >&2
       exit 1
     else
-      IFS=$'\t' read -r tag epoch_val car_size slot_size cid_size slot_missing cid_missing <<<"$line"
-      if [[ "$tag" != "ok" ]]; then
-        printf "Unexpected output while fetching epoch %s. Aborting.\n" "$epoch_i" >&2
-        exit 1
-      fi
-
+      IFS=$'\t' read -r _tag epoch_val _rest <<<"$line"
       if [[ -n "$missing_epoch" && "$epoch_val" -ge "$missing_epoch" ]]; then
         printf "Epoch %s skipped (after 404 at epoch %s).\n" "$epoch_val" "$missing_epoch"
       else
-        epoch_total=$((car_size + slot_size + cid_size))
-        total_bytes=$((total_bytes + epoch_total))
-        car_human=$(format_bytes "$car_size")
-        slot_human=$(format_bytes "$slot_size")
-        cid_human=$(format_bytes "$cid_size")
-        epoch_human=$(format_bytes "$epoch_total")
-        total_human=$(format_bytes "$total_bytes")
-        slot_suffix=""
-        cid_suffix=""
-        if [[ "$slot_missing" == "1" ]]; then slot_suffix=" (missing)"; fi
-        if [[ "$cid_missing" == "1" ]]; then cid_suffix=" (missing)"; fi
-        printf "Epoch %s: car=%s (%s), slot-index=%s (%s)%s, cid-index=%s (%s)%s, epoch total=%s (%s), running total=%s (%s)\n" \
-          "$epoch_val" "$car_size" "$car_human" \
-          "$slot_size" "$slot_human" "$slot_suffix" \
-          "$cid_size" "$cid_human" "$cid_suffix" \
-          "$epoch_total" "$epoch_human" \
-          "$total_bytes" "$total_human"
+        process_line "$line" 0
       fi
     fi
 
