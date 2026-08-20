@@ -42,7 +42,9 @@ tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
 log = "0"
-lencode = { version = "1.2", features = ["solana", "std"] }
+# Pinned to the 1.2.1 heap-overflow fix (compress_and_write scratch reuse),
+# which shred_compression exercises; switch to version = "1.2.1" once published.
+lencode = { git = "https://github.com/sam0x17/lencode", rev = "eccbcbd8f31a3e8a63308901b7c40bc575fc79f7", features = ["solana", "std"] }
 once_cell = "1"
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }

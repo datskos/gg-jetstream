@@ -3425,12 +3425,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3837,7 +3831,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -3845,11 +3839,6 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "headers"
@@ -4673,6 +4662,7 @@ dependencies = [
  "lencode",
  "once_cell",
  "reqwest 0.13.3",
+ "serde",
  "serde_json",
  "solana-account-decoder-client-types",
  "solana-address 1.1.0",
@@ -5090,15 +5080,14 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lencode"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b83550b81db143b0b4445c2fc7fe4a0f19b9b23f089f7c2229536f1482158db"
+version = "1.2.1"
+source = "git+https://github.com/sam0x17/lencode?rev=eccbcbd8f31a3e8a63308901b7c40bc575fc79f7#eccbcbd8f31a3e8a63308901b7c40bc575fc79f7"
 dependencies = [
  "agave-geyser-plugin-interface",
  "ahash 0.8.12",
  "endian-cast",
  "generic-array 1.4.2",
- "hashbrown 0.17.0",
+ "hashbrown 0.12.3",
  "lencode-macros",
  "newt-hype",
  "ruint",
@@ -5121,9 +5110,8 @@ dependencies = [
 
 [[package]]
 name = "lencode-macros"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c87a91e64addd0c8bd21bf68936d2a1abafce1a64335b0cc3c78ad5d56dc98c"
+version = "1.2.1"
+source = "git+https://github.com/sam0x17/lencode?rev=eccbcbd8f31a3e8a63308901b7c40bc575fc79f7#eccbcbd8f31a3e8a63308901b7c40bc575fc79f7"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
