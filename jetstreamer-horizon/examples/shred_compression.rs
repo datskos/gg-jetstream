@@ -38,10 +38,8 @@ use std::io::BufReader;
 
 use jetstreamer_horizon::archive::{ArchiveReader, Consumption, SlotVisitor};
 use jetstreamer_horizon::block_metas::BlockNotification;
-use jetstreamer_horizon::dedupe::{
-    new_decoder_context, new_encoder_context, reset_decoder, reset_encoder,
-};
 use jetstreamer_horizon::entries::EntryRecord;
+use jetstreamer_horizon::pubkey_prime::POPULAR_PUBKEYS;
 use jetstreamer_horizon::transactions as htx;
 use lencode::prelude::*;
 use solana_entry::entry::Entry;
@@ -50,6 +48,51 @@ use solana_message::{
     VersionedMessage as SolVersionedMessage, compiled_instruction::CompiledInstruction, v0,
 };
 use solana_transaction::versioned::VersionedTransaction;
+use std::sync::Arc;
+
+use lencode::context::{DecoderContext, EncoderContext};
+use lencode::dedupe::{DedupeDecoder, DedupeEncodeable, DedupeEncoder};
+
+// The example's own frozen dictionaries, primed as `Pubkey` — the type the
+// solana wire structs dedupe with. Horizon's shared contexts prime the same
+// 65,535 keys but as `Address` (a distinct type); mixing dedupe types in one
+// context trips lencode 1.2's multi-type bug (observed here as heap
+// corruption, not just wrong values), so the example keeps its dedupe
+// universe single-typed.
+fn frozen_encoder() -> Arc<lencode::dedupe::FrozenEncoderState> {
+    let mut primer = DedupeEncoder::new();
+    for pk_bytes in POPULAR_PUBKEYS.iter() {
+        let pk = solana_pubkey::Pubkey::new_from_array(*pk_bytes);
+        primer.prime::<solana_pubkey::Pubkey, <solana_pubkey::Pubkey as DedupeEncodeable>::Hasher>(
+            &pk,
+        );
+    }
+    Arc::new(primer.freeze())
+}
+
+fn frozen_decoder() -> Arc<lencode::dedupe::FrozenDecoderState> {
+    let mut primer = DedupeDecoder::new();
+    for pk_bytes in POPULAR_PUBKEYS.iter() {
+        primer.prime::<solana_pubkey::Pubkey>(solana_pubkey::Pubkey::new_from_array(*pk_bytes));
+    }
+    Arc::new(primer.freeze())
+}
+
+fn new_encoder_context(frozen: &Arc<lencode::dedupe::FrozenEncoderState>) -> EncoderContext {
+    EncoderContext {
+        dedupe: Some(DedupeEncoder::with_frozen(Arc::clone(frozen))),
+        diff: None,
+    }
+}
+
+fn reset_encoder(ctx: &mut EncoderContext) {
+    if std::env::var_os("SHRED_NO_RESET").is_some() {
+        return;
+    }
+    if let Some(enc) = ctx.dedupe.as_mut() {
+        enc.clear();
+    }
+}
 
 /// SIMD-0504: chained data shreds carry at most 1051 - 88 = 963 payload bytes.
 const DATA_SHRED_PAYLOAD: u64 = 963;
@@ -129,7 +172,7 @@ fn to_versioned(tx: &htx::Transaction) -> VersionedTransaction {
 /// caller).
 fn lencode_slot(
     entries: &[Entry],
-    ctx: &mut lencode::context::EncoderContext,
+    ctx: &mut EncoderContext,
     reset_per_tx: bool,
     buf: &mut Vec<u8>,
 ) {
@@ -191,7 +234,9 @@ struct Collector {
     lencode_slot: ModeTotals,
     enc_buf: Vec<u8>,
     verified: bool,
-    ctx: Option<lencode::context::EncoderContext>,
+    frozen_enc: Option<Arc<lencode::dedupe::FrozenEncoderState>>,
+    frozen_dec: Option<Arc<lencode::dedupe::FrozenDecoderState>>,
+    ctx: Option<EncoderContext>,
 }
 
 impl Collector {
@@ -216,26 +261,47 @@ impl Collector {
         }
         assert_eq!(cursor, txs.len(), "entry tx counts must cover the slot");
 
-        let baseline = bincode::serialize(&stream).expect("serialize entry stream");
-        self.wire.add_slot(baseline.len() as u64);
+        if std::env::var_os("SHRED_NO_BINCODE").is_none() {
+            let baseline = bincode::serialize(&stream).expect("serialize entry stream");
+            self.wire.add_slot(baseline.len() as u64);
+        }
 
         // Per-transaction reset mode (SIMD-0385-style independence).
         let mut buf = std::mem::take(&mut self.enc_buf);
-        let mut ctx = self.ctx.take().unwrap_or_else(new_encoder_context);
-        reset_encoder(&mut ctx);
-        lencode_slot(&stream, &mut ctx, true, &mut buf);
-        self.lencode_tx.add_slot(buf.len() as u64);
+        let mut ctx = self.ctx.take().unwrap_or_else(|| {
+            if std::env::var_os("SHRED_PLAIN_DEDUPE").is_some() {
+                EncoderContext {
+                    dedupe: Some(DedupeEncoder::new()),
+                    diff: None,
+                }
+            } else {
+                let frozen = self.frozen_enc.get_or_insert_with(frozen_encoder).clone();
+                new_encoder_context(&frozen)
+            }
+        });
+        if std::env::var_os("SHRED_NO_LENCODE_TX").is_none() {
+            reset_encoder(&mut ctx);
+            lencode_slot(&stream, &mut ctx, true, &mut buf);
+            self.lencode_tx.add_slot(buf.len() as u64);
+        }
 
         // Slot-stream mode (scratch accumulates across the slot).
-        reset_encoder(&mut ctx);
-        lencode_slot(&stream, &mut ctx, false, &mut buf);
-        self.lencode_slot.add_slot(buf.len() as u64);
+        if std::env::var_os("SHRED_NO_LENCODE_SLOT").is_none() {
+            reset_encoder(&mut ctx);
+            lencode_slot(&stream, &mut ctx, false, &mut buf);
+            self.lencode_slot.add_slot(buf.len() as u64);
+        }
         self.ctx = Some(ctx);
 
         // One-time round-trip check on the first non-empty slot.
-        if !self.verified && !stream.is_empty() && stream.iter().any(|e| !e.transactions.is_empty())
+        if std::env::var_os("SHRED_NO_ROUNDTRIP").is_none()
+            && std::env::var_os("SHRED_NO_LENCODE_SLOT").is_none()
+            && !self.verified
+            && !stream.is_empty()
+            && stream.iter().any(|e| !e.transactions.is_empty())
         {
-            verify_roundtrip(&stream, &buf);
+            let frozen_dec = self.frozen_dec.get_or_insert_with(frozen_decoder).clone();
+            verify_roundtrip(&stream, &buf, &frozen_dec);
             self.verified = true;
         }
         self.enc_buf = buf;
@@ -244,9 +310,15 @@ impl Collector {
     }
 }
 
-fn verify_roundtrip(stream: &[Entry], slot_mode_bytes: &[u8]) {
-    let mut ctx = new_decoder_context();
-    reset_decoder(&mut ctx);
+fn verify_roundtrip(
+    stream: &[Entry],
+    slot_mode_bytes: &[u8],
+    frozen: &Arc<lencode::dedupe::FrozenDecoderState>,
+) {
+    let mut ctx = DecoderContext {
+        dedupe: Some(DedupeDecoder::with_frozen(Arc::clone(frozen))),
+        diff: None,
+    };
     let mut cursor = std::io::Cursor::new(slot_mode_bytes);
     let count = u64::decode_ext(&mut cursor, Some(&mut ctx)).expect("decode entry count");
     assert_eq!(count as usize, stream.len());
@@ -308,6 +380,20 @@ fn print_mode(name: &str, m: &ModeTotals, baseline: &ModeTotals, blocks: u64) {
 }
 
 fn main() {
+    // The horizon decode path moves multi-MiB scratch structures through the
+    // stack (Transaction ~12 MiB, BlockNotification ~40 MiB by value in the
+    // worst case); the repo's own pipelines run decode on threads with
+    // enlarged stacks for the same reason.
+    std::thread::Builder::new()
+        .name("shred-compression".into())
+        .stack_size(256 << 20)
+        .spawn(run)
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}
+
+fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = None;
     let mut max_slots = u64::MAX;
