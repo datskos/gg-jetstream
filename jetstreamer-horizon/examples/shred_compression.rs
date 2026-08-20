@@ -6,7 +6,10 @@
 //! bincode-encoded and chopped into data shreds. This example rebuilds that
 //! stream per slot and compares three encodings:
 //!
-//! 1. `bincode` — the wire format Turbine ships today (the baseline).
+//! 1. `wire` — today's shred payload format (bincode, exactly as Turbine
+//!    ships it in agave 3.x; swap to wincode, which is byte-identical, once
+//!    the workspace reaches solana-transaction >= 3.1 with its `wincode`
+//!    feature — currently blocked by an agave =3.0.2 pin).
 //! 2. `lencode/tx` — lencode with the frozen 65,535-entry prime table, dedupe
 //!    scratch reset per transaction. Models SIMD-0385-style per-transaction
 //!    independent encoding (each transaction decodable alone).
@@ -183,7 +186,7 @@ struct Collector {
     slots: u64,
     blocks: u64,
     tx_total: u64,
-    bincode: ModeTotals,
+    wire: ModeTotals,
     lencode_tx: ModeTotals,
     lencode_slot: ModeTotals,
     enc_buf: Vec<u8>,
@@ -213,8 +216,8 @@ impl Collector {
         }
         assert_eq!(cursor, txs.len(), "entry tx counts must cover the slot");
 
-        let baseline = bincode::serialize(&stream).expect("bincode entry stream");
-        self.bincode.add_slot(baseline.len() as u64);
+        let baseline = bincode::serialize(&stream).expect("serialize entry stream");
+        self.wire.add_slot(baseline.len() as u64);
 
         // Per-transaction reset mode (SIMD-0385-style independence).
         let mut buf = std::mem::take(&mut self.enc_buf);
@@ -294,7 +297,7 @@ fn print_mode(name: &str, m: &ModeTotals, baseline: &ModeTotals, blocks: u64) {
     let vs_wire = 100.0 * (1.0 - m.wire_bytes as f64 / baseline.wire_bytes as f64);
     println!(
         "  {name:<14} {:>14} bytes  ({:>7.1} KiB/block)  {:>10} data shreds  {:>9.2} GiB wire  \
-         [{:>5.1}% bytes, {:>5.1}% wire vs bincode]",
+         [{:>5.1}% bytes, {:>5.1}% wire vs wire]",
         m.bytes,
         m.bytes as f64 / blocks.max(1) as f64 / 1024.0,
         m.data_shreds,
@@ -344,9 +347,9 @@ fn main() {
         "model: {DATA_SHRED_PAYLOAD} B payload/data shred, {FEC_DATA_SHREDS}+{FEC_DATA_SHREDS} \
          FEC sets, {PACKET_BYTES} B packets, entry hashes as 32-byte placeholders\n"
     );
-    print_mode("bincode", &c.bincode, &c.bincode, c.blocks);
-    print_mode("lencode/tx", &c.lencode_tx, &c.bincode, c.blocks);
-    print_mode("lencode/slot", &c.lencode_slot, &c.bincode, c.blocks);
+    print_mode("wire (bincode)", &c.wire, &c.wire, c.blocks);
+    print_mode("lencode/tx", &c.lencode_tx, &c.wire, c.blocks);
+    print_mode("lencode/slot", &c.lencode_slot, &c.wire, c.blocks);
     println!(
         "\nlencode/tx   = frozen 65,535-entry table only, scratch reset per transaction \
          (SIMD-0385-style per-tx independence)"
