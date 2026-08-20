@@ -49,6 +49,7 @@ solana-entry.workspace = true
 # >= 3.1, whose `wincode` feature is currently blocked by an agave =3.0.2 pin.
 bincode.workspace = true
 solana-transaction.workspace = true
+serde = { workspace = true, features = ["derive"] }
 solana-signature.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
 serde_json.workspace = true

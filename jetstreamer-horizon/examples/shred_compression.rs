@@ -50,6 +50,24 @@ use solana_message::{
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
 
+/// Neutral transport schema for `--dump-msgs`: real mainnet message bodies
+/// (static account keys, blockhash, instructions) serialized with plain
+/// bincode, consumed by lencode's `wire_speed` example for codec speed
+/// comparisons (wincode vs lencode) outside this workspace's agave version
+/// pins.
+#[derive(serde::Serialize)]
+struct DumpIx {
+    program_id_index: u8,
+    accounts: Vec<u8>,
+    data: Vec<u8>,
+}
+#[derive(serde::Serialize)]
+struct DumpMsg {
+    account_keys: Vec<[u8; 32]>,
+    recent_blockhash: [u8; 32],
+    instructions: Vec<DumpIx>,
+}
+
 use lencode::context::{DecoderContext, EncoderContext};
 use lencode::dedupe::{DedupeDecoder, DedupeEncodeable, DedupeEncoder};
 
@@ -237,6 +255,7 @@ struct Collector {
     frozen_enc: Option<Arc<lencode::dedupe::FrozenEncoderState>>,
     frozen_dec: Option<Arc<lencode::dedupe::FrozenDecoderState>>,
     ctx: Option<EncoderContext>,
+    dump: Option<(String, usize, Vec<DumpMsg>)>,
 }
 
 impl Collector {
@@ -340,6 +359,52 @@ fn verify_roundtrip(
 
 impl SlotVisitor for Collector {
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, tx: &htx::Transaction) {
+        if let Some((path, count, msgs)) = self.dump.as_mut() {
+            let (keys, blockhash, ixs) = match &tx.message {
+                    htx::VersionedMessage::Legacy(m) => (
+                        m.account_keys.as_slice(),
+                        m.recent_blockhash,
+                        m.instructions.as_slice(),
+                    ),
+                    htx::VersionedMessage::V0(m) => (
+                        m.account_keys.as_slice(),
+                        m.recent_blockhash,
+                        m.instructions.as_slice(),
+                    ),
+                };
+            msgs.push(DumpMsg {
+                account_keys: keys
+                    .iter()
+                    .map(|k| <[u8; 32]>::try_from(k.as_ref()).expect("32-byte key"))
+                    .collect(),
+                recent_blockhash: <[u8; 32]>::try_from(blockhash.as_ref())
+                    .expect("32-byte hash"),
+                instructions: ixs
+                    .iter()
+                    .map(|ix| DumpIx {
+                        program_id_index: ix.program_id_index,
+                        accounts: ix.accounts.as_slice().to_vec(),
+                        data: ix.data.as_slice().to_vec(),
+                    })
+                    .collect(),
+            });
+            if msgs.len() >= *count {
+                let bytes = bincode::serialize(&msgs).expect("serialize dump");
+                std::fs::write(&*path, &bytes).expect("write dump");
+                let mut prime = Vec::with_capacity(POPULAR_PUBKEYS.len() * 32);
+                for pk in POPULAR_PUBKEYS.iter() {
+                    prime.extend_from_slice(pk);
+                }
+                std::fs::write(format!("{path}.prime"), &prime).expect("write prime table");
+                eprintln!(
+                    "dumped {} messages ({} bytes) + prime table to {path}(.prime)",
+                    msgs.len(),
+                    bytes.len()
+                );
+                std::process::exit(0);
+            }
+            return;
+        }
         self.txs.push(to_versioned(tx));
     }
 
@@ -349,6 +414,7 @@ impl SlotVisitor for Collector {
             BlockNotification::Skipped(_) => {
                 self.txs.clear();
             }
+            _ if self.dump.is_some() => {}
             _ => self.process_block(entries),
         }
         if self.slots % 10_000 == 0 {
@@ -397,12 +463,20 @@ fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = None;
     let mut max_slots = u64::MAX;
+    let mut dump: Option<(String, usize, Vec<DumpMsg>)> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--max-slots" => {
                 i += 1;
                 max_slots = args[i].parse().expect("--max-slots N");
+            }
+            "--dump-msgs" => {
+                i += 1;
+                let out = args[i].clone();
+                i += 1;
+                let n: usize = args[i].parse().expect("--dump-msgs PATH N");
+                dump = Some((out, n, Vec::with_capacity(n)));
             }
             other if path.is_none() => path = Some(other.to_string()),
             other => {
@@ -419,7 +493,10 @@ fn run() {
 
     let file = File::open(&path).expect("open archive");
     let mut reader = ArchiveReader::open(BufReader::new(file)).expect("parse archive");
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        dump,
+        ..Collector::default()
+    };
     reader
         .read_slots(0, max_slots, &mut collector)
         .expect("read slots");
