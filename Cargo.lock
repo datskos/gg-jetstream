@@ -5081,7 +5081,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "lencode"
 version = "1.2.1"
-source = "git+https://github.com/sam0x17/lencode?rev=eccbcbd8f31a3e8a63308901b7c40bc575fc79f7#eccbcbd8f31a3e8a63308901b7c40bc575fc79f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "333212e14789d230ad297599d2dbf3911cd80d9d70a6a8261bbc81a0f3a89bea"
 dependencies = [
  "agave-geyser-plugin-interface",
  "ahash 0.8.12",
@@ -5111,7 +5112,8 @@ dependencies = [
 [[package]]
 name = "lencode-macros"
 version = "1.2.1"
-source = "git+https://github.com/sam0x17/lencode?rev=eccbcbd8f31a3e8a63308901b7c40bc575fc79f7#eccbcbd8f31a3e8a63308901b7c40bc575fc79f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1067b997075d866aeabca5db72a2c48d94430ec93b14e336fe17ee3f46016268"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
