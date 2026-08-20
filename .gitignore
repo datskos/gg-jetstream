@@ -5,3 +5,5 @@
 
 /.claude
 old-faithful-sizes.tsv
+jets/*
+!jets/.gitkeep
