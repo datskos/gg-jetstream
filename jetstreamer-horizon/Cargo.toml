@@ -43,6 +43,8 @@ solana-message.workspace = true
 solana-pubkey.workspace = true
 # verify_archive --full: canonical PoH recompute + seed fetch
 solana-entry.workspace = true
+# shred_compression example: bincode baseline (turbine wire format)
+bincode.workspace = true
 solana-transaction.workspace = true
 solana-signature.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
