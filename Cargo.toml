@@ -104,7 +104,7 @@ solana-svm = "3"
 solana-svm-timings = "3"
 solana-sysvar = "=3.0.0"
 solana-transaction-context = "3"
-solana-system-interface = "2"
+solana-system-interface = "3"
 solana-cpi = "3"
 solana-genesis-utils = { version = "3", features = ["agave-unstable-api"] }
 sha2 = "0.10"
