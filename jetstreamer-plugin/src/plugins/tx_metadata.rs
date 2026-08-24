@@ -617,6 +617,40 @@ mod tests {
     }
 
     #[test]
+    fn compute_budget_instruction_counts_toward_default_scheduler_limit() {
+        let keys = [
+            Address::new_from_array([1; 32]),
+            solana_sdk_ids::compute_budget::id(),
+        ];
+        let cu_price = [3, 0x40, 0x42, 0x0f, 0, 0, 0, 0, 0]; // 1_000_000
+
+        let row = parse_tx_metadata(
+            TxMetadataInput {
+                slot: 1,
+                tx_idx: 0,
+                num_signatures: 1,
+                header: MessageHeaderView {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                is_legacy: true,
+                fee: 8_000,
+                compute_units_consumed: None,
+                is_success: true,
+                accounts: ResolvedAccounts::new(&keys, &[], &[]),
+            },
+            [ix(1, &cu_price)],
+        );
+
+        // Agave assigns 3,000 CU to the compute-budget builtin when there is
+        // no SetComputeUnitLimit instruction. That also produces a 3,000
+        // lamport priority fee at 1 lamport per CU.
+        assert_eq!(row.scheduler_cost_units, Some(20_406));
+        assert_eq!(row.scheduler_priority, Some(269_515));
+    }
+
+    #[test]
     fn resolves_loaded_program_addresses() {
         let static_keys = [Address::default()];
         let loaded_writable = [solana_sdk_ids::compute_budget::id()];

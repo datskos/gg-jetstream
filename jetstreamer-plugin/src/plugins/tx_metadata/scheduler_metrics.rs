@@ -183,6 +183,11 @@ where
                 )?,
                 _ => return None,
             }
+            // Agave's default-limit pass classifies every instruction,
+            // including compute-budget instructions. The compute-budget
+            // program is a non-migrating builtin and receives the 3,000-CU
+            // builtin allocation when no explicit CU limit was requested.
+            builtin_instructions = builtin_instructions.saturating_add(1);
         } else if is_agave_4_2_builtin(program_id) {
             builtin_instructions = builtin_instructions.saturating_add(1);
         } else {
