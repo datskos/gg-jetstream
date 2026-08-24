@@ -8,3 +8,7 @@ pub mod program_tracking;
 pub mod pubkey_stats;
 /// Horizon-native port of the pubkey mention tracker.
 pub mod pubkey_stats_horizon;
+/// Plugin that stores compact per-transaction execution metadata.
+pub mod tx_metadata;
+/// Horizon-native port of the transaction metadata plugin.
+pub mod tx_metadata_horizon;

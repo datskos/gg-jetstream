@@ -144,7 +144,7 @@ use jetstreamer_plugin::{
     Plugin, PluginRunner, PluginRunnerError,
     plugins::{
         instruction_tracking::InstructionTrackingPlugin, program_tracking::ProgramTrackingPlugin,
-        pubkey_stats::PubkeyStatsPlugin,
+        pubkey_stats::PubkeyStatsPlugin, tx_metadata::TxMetadataPlugin,
     },
 };
 use std::sync::Arc;
@@ -662,6 +662,8 @@ pub enum BuiltinPlugin {
     InstructionTracking,
     /// Pubkey Stats.
     PubkeyStats,
+    /// Transaction Metadata.
+    TxMetadata,
 }
 
 impl BuiltinPlugin {
@@ -670,6 +672,7 @@ impl BuiltinPlugin {
         Self::ProgramTracking,
         Self::InstructionTracking,
         Self::PubkeyStats,
+        Self::TxMetadata,
     ];
 
     /// The CLI flag name for this plugin, as accepted by `--with-plugin`.
@@ -678,6 +681,7 @@ impl BuiltinPlugin {
             Self::ProgramTracking => "program-tracking",
             Self::InstructionTracking => "instruction-tracking",
             Self::PubkeyStats => "pubkey-stats",
+            Self::TxMetadata => "tx-metadata",
         }
     }
 
@@ -690,6 +694,7 @@ impl BuiltinPlugin {
             Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new()),
             Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new()),
             Self::PubkeyStats => Box::new(PubkeyStatsPlugin::new()),
+            Self::TxMetadata => Box::new(TxMetadataPlugin::new()),
         }
     }
 }
@@ -711,7 +716,8 @@ impl BuiltinPlugin {
 ///
 /// CLI flags:
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking`,
-///   `instruction-tracking`, or `pubkey-stats`). When omitted, the CLI defaults to `program-tracking`.
+///   `instruction-tracking`, `pubkey-stats`, or `tx-metadata`). When omitted, the CLI defaults
+///   to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
 /// - `--list-plugins`: Returns [`CliInvocation::ListPlugins`].
 /// - `--sequential`: Enables single-thread sequential firehose mode.

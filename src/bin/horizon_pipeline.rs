@@ -26,6 +26,7 @@ use jetstreamer_plugin::horizon::{
 };
 use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
+use jetstreamer_plugin::plugins::tx_metadata_horizon::TxMetadataHorizonPlugin;
 
 // jemalloc, for the same reason as jetstreamer-node: the decode path churns
 // huge short-lived allocations across many threads, where glibc malloc costs
@@ -344,6 +345,7 @@ async fn main() {
         vec![
             Arc::new(PubkeyStatsHorizonPlugin::new()),
             Arc::new(AccountWritesPlugin::new()),
+            Arc::new(TxMetadataHorizonPlugin::new()),
         ]
     };
 

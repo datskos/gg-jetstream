@@ -26,8 +26,11 @@ pub use jetstreamer_horizon::archive::Consumption;
 
 use crate::PluginFuture;
 
-/// Slots a worker decodes between row flushes (bounds in-memory accumulation).
-const FLUSH_INTERVAL_SLOTS: u32 = 1024;
+/// Default number of slots a worker decodes between row flushes. Plugins with
+/// one output row per input transaction can override this through
+/// [`PluginWorker::flush_interval_slots`] to bound their substantially larger
+/// batches.
+const DEFAULT_FLUSH_INTERVAL_SLOTS: u32 = 1024;
 
 const LOG_TARGET: &str = "jetstreamer_horizon_plugin";
 
@@ -121,6 +124,12 @@ pub trait PluginWorker: Send {
     /// Emit accumulated rows to `out`. Called periodically while reading and
     /// once at the end.
     fn flush(&mut self, _out: &Output) {}
+    /// Number of completed slots between periodic calls to [`Self::flush`].
+    /// Aggregate plugins normally use the 1,024-slot default; per-transaction
+    /// plugins should choose a smaller interval to keep memory bounded.
+    fn flush_interval_slots(&self) -> u32 {
+        DEFAULT_FLUSH_INTERVAL_SLOTS
+    }
 }
 
 /// A horizon plugin: a shared factory that spawns one [`PluginWorker`] per
@@ -167,7 +176,9 @@ pub trait HorizonPlugin: Send + Sync + 'static {
 struct Dispatch {
     workers: Vec<Box<dyn PluginWorker>>,
     output: Output,
-    since_flush: u32,
+    /// Per-worker counters because plugins can request different batch
+    /// cadences according to their output cardinality.
+    since_flush: Vec<u32>,
     /// Union of every registered plugin's declared consumption, computed
     /// once by the runner: the decoder materializes a stream field iff at
     /// least one plugin consumes it.
@@ -197,13 +208,12 @@ impl SlotVisitor for Dispatch {
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
-        for w in &mut self.workers {
+        for (worker_index, w) in self.workers.iter_mut().enumerate() {
             w.on_block(notification, entries);
-        }
-        self.since_flush += 1;
-        if self.since_flush >= FLUSH_INTERVAL_SLOTS {
-            self.since_flush = 0;
-            for w in &mut self.workers {
+            let since_flush = &mut self.since_flush[worker_index];
+            *since_flush = since_flush.saturating_add(1);
+            if *since_flush >= w.flush_interval_slots().max(1) {
+                *since_flush = 0;
                 w.flush(&self.output);
             }
         }
@@ -334,11 +344,18 @@ impl HorizonPluginRunner {
             combined.account_update_data
         );
         let plugins = self.plugins.clone();
-        let make_visitor = move |thread_id: usize| Dispatch {
-            workers: plugins.iter().map(|p| p.spawn_worker(thread_id)).collect(),
-            output: output.clone(),
-            since_flush: 0,
-            consumption: combined,
+        let make_visitor = move |thread_id: usize| {
+            let workers: Vec<Box<dyn PluginWorker>> = plugins
+                .iter()
+                .map(|plugin| plugin.spawn_worker(thread_id))
+                .collect();
+            let since_flush = vec![0; workers.len()];
+            Dispatch {
+                workers,
+                output: output.clone(),
+                since_flush,
+                consumption: combined,
+            }
         };
 
         // `make_visitor` (and its captured `output`) is dropped when this
@@ -373,6 +390,7 @@ mod tests {
     struct CountingWorker {
         blocks: Arc<AtomicU32>,
         flushes: Arc<AtomicU32>,
+        flush_interval_slots: u32,
     }
 
     impl PluginWorker for CountingWorker {
@@ -381,6 +399,9 @@ mod tests {
         }
         fn flush(&mut self, _out: &Output) {
             self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        fn flush_interval_slots(&self) -> u32 {
+            self.flush_interval_slots
         }
     }
 
@@ -398,23 +419,63 @@ mod tests {
             workers: vec![Box::new(CountingWorker {
                 blocks: blocks.clone(),
                 flushes: flushes.clone(),
+                flush_interval_slots: DEFAULT_FLUSH_INTERVAL_SLOTS,
             })],
             output,
-            since_flush: 0,
+            since_flush: vec![0],
             consumption: Consumption::all(),
         };
 
         let note = BlockNotification::new_boxed();
-        for _ in 0..FLUSH_INTERVAL_SLOTS {
+        for _ in 0..DEFAULT_FLUSH_INTERVAL_SLOTS {
             dispatch.on_block(&note, &[]);
         }
         // Every block forwarded; exactly one periodic flush at the interval.
-        assert_eq!(blocks.load(Ordering::Relaxed), FLUSH_INTERVAL_SLOTS);
+        assert_eq!(blocks.load(Ordering::Relaxed), DEFAULT_FLUSH_INTERVAL_SLOTS);
         assert_eq!(flushes.load(Ordering::Relaxed), 1);
 
         // finish() triggers the final flush.
         dispatch.finish();
         assert_eq!(flushes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn dispatch_honors_each_workers_flush_interval() {
+        let blocks = Arc::new(AtomicU32::new(0));
+        let flushes_every_two = Arc::new(AtomicU32::new(0));
+        let flushes_every_three = Arc::new(AtomicU32::new(0));
+        let (tx, _rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_CAP);
+        let output = Output {
+            tx,
+            backlog: Arc::new(AtomicU64::new(0)),
+            db: Arc::new(Client::default()),
+        };
+        let mut dispatch = Dispatch {
+            workers: vec![
+                Box::new(CountingWorker {
+                    blocks: blocks.clone(),
+                    flushes: flushes_every_two.clone(),
+                    flush_interval_slots: 2,
+                }),
+                Box::new(CountingWorker {
+                    blocks: blocks.clone(),
+                    flushes: flushes_every_three.clone(),
+                    flush_interval_slots: 3,
+                }),
+            ],
+            output,
+            since_flush: vec![0, 0],
+            consumption: Consumption::all(),
+        };
+
+        let note = BlockNotification::new_boxed();
+        for _ in 0..6 {
+            dispatch.on_block(&note, &[]);
+        }
+
+        assert_eq!(blocks.load(Ordering::Relaxed), 12);
+        assert_eq!(flushes_every_two.load(Ordering::Relaxed), 3);
+        assert_eq!(flushes_every_three.load(Ordering::Relaxed), 2);
     }
 
     /// The runner materializes a stream field iff at least one plugin

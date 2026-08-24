@@ -50,9 +50,10 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
 Jetstreamer Runner with the Program Tracking plugin enabled. The built-in plugins are
-`program-tracking`, `instruction-tracking`, and `pubkey-stats`; pass `--with-plugin <name>` to
-select one (repeat the flag to run multiple at once), or `--no-plugins` to disable the default.
-Run `--list-plugins` to print the names of every bundled plugin and exit.
+`program-tracking`, `instruction-tracking`, `pubkey-stats`, and `tx-metadata`; pass
+`--with-plugin <name>` to select one (repeat the flag to run multiple at once), or
+`--no-plugins` to disable the default. Run `--list-plugins` to print the names of every bundled
+plugin and exit.
 
 ### Jetstreamer Runner CLI
 
@@ -75,6 +76,9 @@ cargo run --release -- 950 --tui
 
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
+
+# Store one compact execution-metadata row per transaction
+cargo run --release -- 800 --with-plugin tx-metadata
 
 # Point the runner at an external ClickHouse instance (overrides JETSTREAMER_CLICKHOUSE_DSN)
 cargo run --release -- 800 --clickhouse-dsn http://clickhouse.example.com:8123
@@ -114,7 +118,12 @@ The built-in `program-tracking` and `instruction-tracking` plugins record vote a
 activity separately: `program_invocations` includes an `is_vote` flag per row, while
 `slot_instructions` stores separate vote/non-vote instruction and transaction counts. The
 `pubkey-stats` plugin aggregates per-slot account-key mention counts into a `pubkey_mentions`
-table (with a companion `pubkeys` lookup table populated via materialised view).
+table (with a companion `pubkeys` lookup table populated via materialised view). The
+`tx-metadata` plugin writes one compact row per transaction to `tx_meta_v2`, matching
+`gg-mev-hub`'s execution-metadata semantics without constructing its intermediate
+`GhostTransaction` or storing transaction signatures. It also stores Agave's estimated
+`scheduler_cost_units` and reward-per-cost `scheduler_priority`; both are nullable when a
+transaction's scheduler configuration cannot be derived.
 
 The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range (`900-950`),
 or an inclusive `<start>:<end>` slot range on the command line. See
