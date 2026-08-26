@@ -4005,6 +4005,9 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
 
 struct BankTransactionNotifier {
     progress: Arc<ReplayProgress>,
+    replayed_tx_count: Arc<AtomicU64>,
+    target_tx_count: Arc<AtomicU64>,
+    target_start: Slot,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
@@ -4050,6 +4053,10 @@ impl TransactionNotifier for BankTransactionNotifier {
                 if inserted {
                     self.progress.note_tx_slot(slot);
                     self.progress.inc_tx();
+                    self.replayed_tx_count.fetch_add(1, Ordering::Relaxed);
+                    if slot >= self.target_start {
+                        self.target_tx_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
@@ -4318,12 +4325,61 @@ fn parse_epoch_range(arg: &str) -> Result<(u64, u64), String> {
     Ok((start, end))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotReplayRange {
+    start: Slot,
+    end_inclusive: Slot,
+    epoch: u64,
+}
+
+/// Parses the slot replay form accepted by `replay-slots`: an inclusive
+/// `START:END` range contained by one target epoch.
+fn parse_slot_replay_range(arg: &str) -> Result<SlotReplayRange, String> {
+    let (start, end) = arg
+        .split_once(':')
+        .ok_or_else(|| format!("invalid slot range '{arg}': expected START:END"))?;
+    let parse = |value: &str, name: &str| -> Result<Slot, String> {
+        value
+            .trim()
+            .parse::<Slot>()
+            .map_err(|err| format!("invalid {name} slot '{}': {err}", value.trim()))
+    };
+    let start = parse(start, "start")?;
+    let end_inclusive = parse(end, "end")?;
+    if start == 0 {
+        return Err("invalid slot range: START must be greater than zero".to_string());
+    }
+    if end_inclusive < start {
+        return Err(format!(
+            "invalid slot range '{arg}': end {end_inclusive} is before start {start}"
+        ));
+    }
+    let epoch = slot_to_epoch(start);
+    let end_epoch = slot_to_epoch(end_inclusive);
+    if end_epoch != epoch {
+        return Err(format!(
+            "slot range '{arg}' crosses an epoch boundary ({epoch} to {end_epoch}); \
+             replay-slots currently accepts one target epoch"
+        ));
+    }
+    Ok(SlotReplayRange {
+        start,
+        end_inclusive,
+        epoch,
+    })
+}
+
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
+        "Usage:\n\
+         {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
+         {program} replay-slots START:END [cache-dir] [--verify|--no-verify]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
+         replay-slots accepts an inclusive, single-epoch slot range. It automatically\n\
+         downloads or reuses the newest snapshot before START, warms the Bank forward,\n\
+         and replays through END without writing a horizon archive.\n\
          A range pre-downloads every epoch's boundary snapshot and snapshot hashes\n\
          up front (the only gcloud/GCS access), then runs each epoch in its own\n\
          child process so replay memory is fully released at every epoch boundary.\n\
@@ -4490,6 +4546,16 @@ async fn snapshot_expectations_for_epoch(
             return Err(format!("duplicate snapshot entry for slot {slot}"));
         }
     }
+    Ok(expected)
+}
+
+async fn snapshot_expectations_for_slot_range(
+    epoch: u64,
+    start: Slot,
+    end_inclusive: Slot,
+) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
+    let mut expected = snapshot_expectations_for_epoch(epoch).await?;
+    expected.retain(|slot, _| *slot >= start && *slot <= end_inclusive);
     Ok(expected)
 }
 
@@ -5816,16 +5882,32 @@ async fn build_slot_presence_map(
     .map_err(|err| format!("slot presence task failed: {err}"))?
 }
 
+#[derive(Debug)]
+struct ReplayWindow {
+    target_start: Slot,
+    end_inclusive: Slot,
+    horizon_output: Option<PathBuf>,
+    use_dir_loader: bool,
+}
+
+struct ReplayRunResult {
+    bank_forks: Arc<RwLock<BankForks>>,
+    snapshot_slot: Slot,
+    replay_start: Slot,
+    replayed_transactions: u64,
+    target_transactions: u64,
+}
+
 #[allow(clippy::too_many_arguments)] // top-level replay entry point: CLI params map 1:1
 async fn run_geyser_replay(
     epoch: u64,
+    window: ReplayWindow,
     ledger_dir: &Path,
     snapshot_archive: &Path,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
-    horizon_output: PathBuf,
     // When set, reuse this bank (carried from the previous epoch in a range
     // run) instead of loading a snapshot — no reload, no warmup.
     existing_bank_forks: Option<Arc<RwLock<BankForks>>>,
@@ -5839,12 +5921,17 @@ async fn run_geyser_replay(
     // instance would leave chained epochs stuck at accounts=0 and falsely abort.
     // Counters are reset per epoch below, so sharing does not accumulate.
     carried_progress: Option<Arc<ReplayProgress>>,
-) -> Result<Arc<RwLock<BankForks>>, String> {
+) -> Result<ReplayRunResult, String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
         std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
-    let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
-    let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(epoch_start)));
+    let ReplayWindow {
+        target_start,
+        end_inclusive,
+        horizon_output,
+        use_dir_loader,
+    } = window;
+    let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(target_start)));
     // Fresh per-epoch baseline: a chained epoch reuses the shared instance, so
     // clear last-run counts before this epoch's replay begins (no notifications
     // are in flight here — the previous epoch's replay has fully returned).
@@ -5884,7 +5971,7 @@ async fn run_geyser_replay(
             let accounts_update_notifier: Option<AccountsUpdateNotifier> =
                 Some(Arc::new(ProgressAccountsUpdateNotifier {
                     progress: progress.clone(),
-                    live_start_slot: epoch_start,
+                    live_start_slot: target_start,
                 }) as AccountsUpdateNotifier);
             info!("accounts update notifier wired into snapshot load: true");
             // Genesis archive is fetched up front in main() (before the replay
@@ -5892,7 +5979,6 @@ async fn run_geyser_replay(
             info!("loading bank from snapshot");
             let ledger_dir_for_load = ledger_dir.clone();
             let snapshot_archive = snapshot_archive.to_path_buf();
-            let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
             let bank = tokio::task::spawn_blocking(move || {
                 if use_dir_loader {
                     load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
@@ -5914,21 +6000,23 @@ async fn run_geyser_replay(
             (BankSource::Fresh(Box::new(bank)), slot)
         }
     };
-    let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
+    let replay_start = if snapshot_slot.saturating_add(1) < target_start {
         snapshot_slot.saturating_add(1)
     } else {
-        epoch_start
+        target_start
     };
-    if replay_start < epoch_start {
+    if replay_start < target_start {
         info!(
-            "warming up replay from slot {} to {} (epoch {} starts at {})",
+            "warming up replay from slot {} to {} (target range starts at {})",
             replay_start,
-            epoch_start.saturating_sub(1),
-            epoch,
-            epoch_start
+            target_start.saturating_sub(1),
+            target_start
         );
     } else {
-        info!("starting replay at epoch {} slot {}", epoch, replay_start);
+        info!(
+            "starting target replay at epoch {} slot {}",
+            epoch, replay_start
+        );
     }
     progress.reset_last_slots(replay_start.saturating_sub(1));
 
@@ -5946,20 +6034,27 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
-    horizon::init(
-        &horizon_output,
-        epoch,
-        epoch_start,
-        end_inclusive - epoch_start + 1,
-        slot_presence.clone(),
-    )?;
-    info!(
-        "horizon archive recording to {} (epoch {}, slots {}..={})",
-        horizon_output.display(),
-        epoch,
-        epoch_start,
-        end_inclusive
-    );
+    if let Some(horizon_output) = horizon_output.as_ref() {
+        horizon::init(
+            horizon_output,
+            epoch,
+            target_start,
+            end_inclusive - target_start + 1,
+            slot_presence.clone(),
+        )?;
+        info!(
+            "horizon archive recording to {} (epoch {}, slots {}..={})",
+            horizon_output.display(),
+            epoch,
+            target_start,
+            end_inclusive
+        );
+    } else {
+        info!(
+            "horizon archive recording disabled (epoch {}, slots {}..={})",
+            epoch, target_start, end_inclusive
+        );
+    }
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
@@ -6012,7 +6107,7 @@ async fn run_geyser_replay(
             cursor.clone(),
             scheduler.clone(),
             firehose_gate.clone(),
-            epoch_start,
+            target_start,
             enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride,
@@ -6025,7 +6120,7 @@ async fn run_geyser_replay(
             cursor.clone(),
             scheduler.clone(),
             firehose_gate.clone(),
-            epoch_start,
+            target_start,
             enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride,
@@ -6080,8 +6175,13 @@ async fn run_geyser_replay(
     let index_base_url = resolve_remote_index_base_url()?;
     let active_firehose_stop = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
     let backpressure_stop_requested = Arc::new(AtomicBool::new(false));
+    let replayed_tx_count = Arc::new(AtomicU64::new(0));
+    let target_tx_count = Arc::new(AtomicU64::new(0));
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         progress: progress.clone(),
+        replayed_tx_count: replayed_tx_count.clone(),
+        target_tx_count: target_tx_count.clone(),
+        target_start,
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
@@ -6107,7 +6207,7 @@ async fn run_geyser_replay(
         progress: progress.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        live_start_slot: epoch_start,
+        live_start_slot: target_start,
         shutdown: shutdown.clone(),
         active_firehose_stop: active_firehose_stop.clone(),
         backpressure_stop_requested: backpressure_stop_requested.clone(),
@@ -6149,14 +6249,14 @@ async fn run_geyser_replay(
         let shutdown = shutdown.clone();
         let range_progress = range_progress.clone();
         std::thread::spawn(move || {
-            let has_warmup = replay_start < epoch_start;
-            let warmup_end = epoch_start.saturating_sub(1);
+            let has_warmup = replay_start < target_start;
+            let warmup_end = target_start.saturating_sub(1);
             let warmup_total = if has_warmup {
                 warmup_end.saturating_sub(replay_start).saturating_add(1)
             } else {
                 0
             };
-            let main_total = end_inclusive.saturating_sub(epoch_start).saturating_add(1);
+            let main_total = end_inclusive.saturating_sub(target_start).saturating_add(1);
             let stall_interval = env::var("JETSTREAMER_STALL_LOG_SECS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -6213,7 +6313,7 @@ async fn run_geyser_replay(
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
                 let last_account_update_slot =
                     progress.last_account_update_slot.load(Ordering::Relaxed);
-                let phase = if in_warmup && latest < epoch_start {
+                let phase = if in_warmup && latest < target_start {
                     "warmup"
                 } else {
                     "main"
@@ -6302,18 +6402,18 @@ async fn run_geyser_replay(
                             if remaining_slots == 0 {
                                 "00:00:00".to_string()
                             } else if let Some(start) = phase_start {
-                                let processed = if in_warmup && latest < epoch_start {
+                                let processed = if in_warmup && latest < target_start {
                                     if latest < replay_start {
                                         0
                                     } else {
                                         latest.saturating_sub(replay_start).saturating_add(1)
                                     }
                                 } else {
-                                    let display_slot = latest.clamp(epoch_start, end_inclusive);
-                                    if display_slot < epoch_start {
+                                    let display_slot = latest.clamp(target_start, end_inclusive);
+                                    if display_slot < target_start {
                                         0
                                     } else {
-                                        display_slot.saturating_sub(epoch_start).saturating_add(1)
+                                        display_slot.saturating_sub(target_start).saturating_add(1)
                                     }
                                 };
                                 let elapsed = start.elapsed().as_secs_f64();
@@ -6494,7 +6594,7 @@ async fn run_geyser_replay(
                     }
                 }
                 last_seen_tx_count = tx_count;
-                if in_warmup && latest < epoch_start {
+                if in_warmup && latest < target_start {
                     let processed = if latest < replay_start {
                         0
                     } else {
@@ -6554,7 +6654,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (target starts at {target_start})"
                     );
                     maybe_log_phases(false);
                 } else {
@@ -6562,8 +6662,8 @@ async fn run_geyser_replay(
                         in_warmup = false;
                         phase_start = Some(Instant::now());
                         main_rate_baseline = latest
-                            .clamp(epoch_start, end_inclusive)
-                            .saturating_sub(epoch_start)
+                            .clamp(target_start, end_inclusive)
+                            .saturating_sub(target_start)
                             .saturating_add(1);
                         progress.reset_counts();
                         last_seen_tx_count = 0;
@@ -6572,11 +6672,11 @@ async fn run_geyser_replay(
                         last_account_change = Instant::now();
                         last_account_log = Instant::now();
                     }
-                    let display_slot = latest.clamp(epoch_start, end_inclusive);
-                    let processed = if display_slot < epoch_start {
+                    let display_slot = latest.clamp(target_start, end_inclusive);
+                    let processed = if display_slot < target_start {
                         0
                     } else {
-                        display_slot.saturating_sub(epoch_start).saturating_add(1)
+                        display_slot.saturating_sub(target_start).saturating_add(1)
                     };
                     let percent = if main_total == 0 {
                         100.0
@@ -6896,7 +6996,13 @@ async fn run_geyser_replay(
     // Hand the live bank forks back so a range run can chain straight into the
     // next epoch without reloading a snapshot.
     let bank_forks = bank_replay.bank_forks();
-    Ok(bank_forks)
+    Ok(ReplayRunResult {
+        bank_forks,
+        snapshot_slot,
+        replay_start,
+        replayed_transactions: replayed_tx_count.load(Ordering::Relaxed),
+        target_transactions: target_tx_count.load(Ordering::Relaxed),
+    })
 }
 
 async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -7180,6 +7286,157 @@ async fn run_epoch_range_supervisor(
     Ok(())
 }
 
+async fn run_slot_replay_command(
+    range: SlotReplayRange,
+    cache_dir: &Path,
+    verify_snapshots: bool,
+    shutdown: Arc<AtomicBool>,
+    cursor: Arc<ReplayCursor>,
+    restart_tracker: Arc<RestartTracker>,
+) -> Result<(), String> {
+    fs::create_dir_all(cache_dir).map_err(|err| {
+        format!(
+            "failed to create cache directory {}: {err}",
+            cache_dir.display()
+        )
+    })?;
+
+    // Replay mutates its live AccountsDB paths. Preserve downloaded archives
+    // and pristine archive extractions, but rebuild all mutable state before
+    // every range run just like the existing epoch path does.
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+        clear_ledger_accounts_state(cache_dir)?;
+    } else {
+        info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
+    }
+
+    let target_snapshot_slot = range.start - 1;
+    let min_snapshot_slot = epoch_to_slot(range.epoch.saturating_sub(1));
+    let existing_snapshot = match find_existing_snapshot_archive(cache_dir, target_snapshot_slot)? {
+        Some(candidate) if candidate.slot < min_snapshot_slot => {
+            info!(
+                "ignoring cached snapshot {} at slot {}: replay-slots requires a snapshot at or \
+                 after slot {} to bound warmup",
+                candidate.path.display(),
+                candidate.slot,
+                min_snapshot_slot
+            );
+            None
+        }
+        other => other,
+    };
+
+    let snapshot_path = match existing_snapshot {
+        Some(candidate) => {
+            info!(
+                "using cached snapshot {} at slot {}",
+                candidate.path.display(),
+                candidate.slot
+            );
+            candidate.path
+        }
+        None => {
+            info!(
+                "downloading newest snapshot at or before slot {} for target epoch {}",
+                target_snapshot_slot, range.epoch
+            );
+            download_snapshot_at_or_before_slot(range.epoch, target_snapshot_slot, cache_dir)
+                .await
+                .map_err(|err| format!("failed to download replay snapshot: {err}"))?
+        }
+    };
+
+    let snapshot_info =
+        FullSnapshotArchiveInfo::new_from_path(snapshot_path.clone()).map_err(|err| {
+            format!(
+                "failed to parse snapshot archive {}: {err}",
+                snapshot_path.display()
+            )
+        })?;
+    let snapshot_slot = snapshot_info.slot();
+    if snapshot_slot >= range.start {
+        return Err(format!(
+            "snapshot slot {snapshot_slot} is not before requested start slot {}",
+            range.start
+        ));
+    }
+    if snapshot_slot < min_snapshot_slot {
+        return Err(format!(
+            "snapshot slot {snapshot_slot} is too old for target epoch {}; need slot {} or newer",
+            range.epoch, min_snapshot_slot
+        ));
+    }
+
+    // Existing behavior: fetch genesis into the same cache if neither
+    // genesis.bin nor genesis.tar.bz2 is present.
+    ensure_genesis_archive(cache_dir).await?;
+
+    let snapshot_verifier = if verify_snapshots {
+        let expected =
+            snapshot_expectations_for_slot_range(range.epoch, range.start, range.end_inclusive)
+                .await?;
+        info!(
+            "snapshot verification enabled for {} checkpoint(s) inside slots {}..={}",
+            expected.len(),
+            range.start,
+            range.end_inclusive
+        );
+        Some(Arc::new(SnapshotVerifier::new(
+            expected,
+            Some(shutdown.clone()),
+        )))
+    } else {
+        None
+    };
+
+    let result = run_geyser_replay(
+        range.epoch,
+        ReplayWindow {
+            target_start: range.start,
+            end_inclusive: range.end_inclusive,
+            horizon_output: None,
+            // replay-slots always consumes the explicitly selected archive;
+            // a global dir-loader toggle must not silently bypass it.
+            use_dir_loader: false,
+        },
+        cache_dir,
+        &snapshot_path,
+        shutdown,
+        cursor,
+        restart_tracker,
+        snapshot_verifier,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    let final_bank = {
+        let guard = result
+            .bank_forks
+            .read()
+            .map_err(|_| "bank forks lock poisoned while reading replay result".to_string())?;
+        guard.working_bank()
+    };
+    final_bank.freeze();
+    let warmup_transactions = result
+        .replayed_transactions
+        .saturating_sub(result.target_transactions);
+    println!(
+        "replay complete: requested={}..={} snapshot_slot={} replay_start={} \
+         warmup_txs={} range_txs={} final_bank_slot={} final_bank_hash={}",
+        range.start,
+        range.end_inclusive,
+        result.snapshot_slot,
+        result.replay_start,
+        warmup_transactions,
+        result.target_transactions,
+        final_bank.slot(),
+        final_bank.hash(),
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -7210,6 +7467,69 @@ async fn main() {
 
     if epoch_arg == "-h" || epoch_arg == "--help" {
         println!("{}", usage(&program));
+        return;
+    }
+
+    if epoch_arg == "replay-slots" {
+        let Some(range_arg) = args.next() else {
+            eprintln!("replay-slots requires an inclusive START:END range");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        };
+        if range_arg == "-h" || range_arg == "--help" {
+            println!("{}", usage(&program));
+            return;
+        }
+        let range = match parse_slot_replay_range(&range_arg) {
+            Ok(range) => range,
+            Err(err) => {
+                eprintln!("{err}");
+                eprintln!("{}", usage(&program));
+                exit(2);
+            }
+        };
+        let mut cache_dir_arg = None;
+        let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
+        for arg in args {
+            if arg == "--verify" {
+                verify_snapshots = true;
+            } else if arg == "--no-verify" {
+                verify_snapshots = false;
+            } else if arg.starts_with('-') {
+                eprintln!("unknown replay-slots option '{arg}'");
+                eprintln!("{}", usage(&program));
+                exit(2);
+            } else if cache_dir_arg.is_none() {
+                cache_dir_arg = Some(PathBuf::from(arg));
+            } else {
+                eprintln!("unexpected replay-slots argument '{arg}'");
+                eprintln!("{}", usage(&program));
+                exit(2);
+            }
+        }
+        let cache_dir = match cache_dir_arg {
+            Some(path) => path,
+            None => match env::current_dir() {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!("failed to read current directory: {err}");
+                    exit(1);
+                }
+            },
+        };
+        if let Err(err) = run_slot_replay_command(
+            range,
+            &cache_dir,
+            verify_snapshots,
+            shutdown,
+            cursor,
+            restart_tracker,
+        )
+        .await
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
         return;
     }
 
@@ -7621,22 +7941,28 @@ async fn main() {
             None
         };
 
+        let (target_start, target_end_inclusive) = epoch_to_slot_range(epoch);
         match run_geyser_replay(
             epoch,
+            ReplayWindow {
+                target_start,
+                end_inclusive: target_end_inclusive,
+                horizon_output: Some(horizon_output),
+                use_dir_loader: env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
+            },
             &dest_dir,
             &dest_path,
             shutdown.clone(),
             cursor.clone(),
             restart_tracker.clone(),
             snapshot_verifier,
-            horizon_output,
             carried_bank_forks.take(),
             range_progress.clone(),
             Some(shared_progress.clone()),
         )
         .await
         {
-            Ok(bank_forks) => carried_bank_forks = Some(bank_forks),
+            Ok(result) => carried_bank_forks = Some(result.bank_forks),
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
@@ -7647,7 +7973,7 @@ async fn main() {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{EntryAccounts, assign_rounds};
+    use super::{EntryAccounts, SlotReplayRange, assign_rounds, parse_slot_replay_range};
     use solana_address::Address;
     use std::collections::HashSet;
 
@@ -7660,6 +7986,26 @@ mod scheduler_tests {
             writes: writes.iter().map(|&b| addr(b)).collect(),
             reads: reads.iter().map(|&b| addr(b)).collect(),
         }
+    }
+
+    #[test]
+    fn parses_inclusive_slot_replay_range() {
+        assert_eq!(
+            parse_slot_replay_range("432123:432999").unwrap(),
+            SlotReplayRange {
+                start: 432123,
+                end_inclusive: 432999,
+                epoch: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_slot_replay_ranges() {
+        assert!(parse_slot_replay_range("123").is_err());
+        assert!(parse_slot_replay_range("0:1").is_err());
+        assert!(parse_slot_replay_range("10:9").is_err());
+        assert!(parse_slot_replay_range("431999:432000").is_err());
     }
 
     /// Flattens rounds back to (entry_index -> round_index) for assertions.
