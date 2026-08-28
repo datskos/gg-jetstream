@@ -410,6 +410,7 @@ struct EntryAccounts {
     reads: std::collections::HashSet<Address>,
 }
 
+#[cfg(test)]
 impl EntryAccounts {
     /// Two entries conflict if they share an account that at least one of
     /// them writes (write-write or write-read). Read-read is not a conflict.
@@ -435,34 +436,45 @@ impl EntryAccounts {
 /// first conflict (which is what limited the old wave scheduler to ~3-4
 /// batches when ~30 threads were available).
 ///
-/// Greedy multi-pass: each pass scans the still-unscheduled entries in
-/// order, placing an entry in the current round unless it conflicts with a
-/// round member *or* with an entry already deferred this pass (the
-/// `blocked` set, which preserves order — a later entry conflicting with a
-/// deferred earlier one must also defer).
+/// The planner is linear in the total number of account references. For each
+/// account it tracks the latest round containing a writer and the latest
+/// round containing any accessor. A reader follows the previous writer; a
+/// writer follows every previous reader or writer. This is the same ordering
+/// constraint as the former greedy multi-pass planner without its quadratic
+/// behavior on hot-account chains.
 fn assign_rounds(entries: &[EntryAccounts]) -> Vec<Vec<usize>> {
     let mut rounds: Vec<Vec<usize>> = Vec::new();
-    let mut remaining: Vec<usize> = (0..entries.len()).collect();
-    while !remaining.is_empty() {
-        let mut round: Vec<usize> = Vec::new();
-        let mut deferred: Vec<usize> = Vec::new();
-        let mut round_acc = EntryAccounts::default();
-        let mut blocked = EntryAccounts::default();
-        for &i in &remaining {
-            let e = &entries[i];
-            if e.conflicts_with(&blocked) || e.conflicts_with(&round_acc) {
-                // Must run after something not yet scheduled this round.
-                blocked.writes.extend(e.writes.iter().copied());
-                blocked.reads.extend(e.reads.iter().copied());
-                deferred.push(i);
-            } else {
-                round_acc.writes.extend(e.writes.iter().copied());
-                round_acc.reads.extend(e.reads.iter().copied());
-                round.push(i);
+    let mut last_write: HashMap<Address, usize> = HashMap::new();
+    let mut last_access: HashMap<Address, usize> = HashMap::new();
+
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let mut round_index = 0usize;
+        for address in &entry.writes {
+            if let Some(previous_round) = last_access.get(address) {
+                round_index = round_index.max(previous_round.saturating_add(1));
             }
         }
-        rounds.push(round);
-        remaining = deferred;
+        for address in &entry.reads {
+            if let Some(previous_round) = last_write.get(address) {
+                round_index = round_index.max(previous_round.saturating_add(1));
+            }
+        }
+
+        if rounds.len() <= round_index {
+            rounds.resize_with(round_index + 1, Vec::new);
+        }
+        rounds[round_index].push(entry_index);
+
+        for address in &entry.writes {
+            last_write.insert(*address, round_index);
+            last_access.insert(*address, round_index);
+        }
+        for address in &entry.reads {
+            last_access
+                .entry(*address)
+                .and_modify(|last_round| *last_round = (*last_round).max(round_index))
+                .or_insert(round_index);
+        }
     }
     rounds
 }
@@ -731,7 +743,7 @@ impl BankReplay {
         }
         self.cursor.update_inflight_stage("bank_for_slot_lock_try");
         let lock_start = Instant::now();
-        let mut guard = match self.bank_forks.try_write() {
+        let guard = match self.bank_forks.try_write() {
             Ok(guard) => guard,
             Err(_) => {
                 self.cursor.update_inflight_stage("bank_for_slot_lock_wait");
@@ -773,11 +785,35 @@ impl BankReplay {
                 .leader_schedule_cache
                 .slot_leader_at(slot, Some(&parent))
                 .unwrap_or_else(|| *parent.leader());
+
+            // Agave 4.2's `Bank::new_from_parent` pre-populates its builtin
+            // program cache. That path reads the BankForks through the
+            // program-cache fork graph. Holding our BankForks write guard
+            // across the constructor therefore self-deadlocks: the same
+            // thread waits forever for its own write guard. This mirrors
+            // `Bank::new_from_parent_with_bank_forks`: construct first, then
+            // acquire the write guard only for insertion.
+            let migration_status = guard.migration_status();
+            drop(guard);
             self.cursor.update_inflight_stage("new_from_parent");
             let mut next_bank = Bank::new_from_parent(parent, collector_id, slot);
             next_bank.set_check_program_deployment_slot(true);
             self.cursor.update_inflight_stage("set_alpenglow_ticks");
-            set_alpenglow_ticks(&next_bank, &guard.migration_status());
+            set_alpenglow_ticks(&next_bank, migration_status.as_ref());
+            self.cursor
+                .update_inflight_stage("bank_for_slot_insert_lock");
+            let mut guard = self
+                .bank_forks
+                .write()
+                .map_err(|_| "bank forks lock poisoned before insert".to_string())?;
+            if guard.highest_slot() != current_slot {
+                return Err(format!(
+                    "bank forks advanced from slot {} to {} while constructing child slot {}",
+                    current_slot,
+                    guard.highest_slot(),
+                    slot
+                ));
+            }
             self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval
@@ -1481,7 +1517,10 @@ impl BankReplay {
         }
     }
 
-    fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+    fn process_ready_entries<F>(&self, entries: Vec<ReadyEntry>, mut on_slot_complete: F)
+    where
+        F: FnMut(Slot, u64, u64, Duration),
+    {
         // Entries arrive strictly slot-ordered; process each slot's
         // contiguous run as one group so its bank is fetched once and
         // entry batches can be wave-scheduled against shared locks.
@@ -1498,7 +1537,15 @@ impl BankReplay {
             while entries.peek().is_some_and(|entry| entry.slot == slot) {
                 group.push(entries.next().expect("peeked entry"));
             }
+            let entry_count = group.len() as u64;
+            let transaction_count = group.iter().map(|entry| entry.tx_count as u64).sum::<u64>();
+            info!(
+                "replay slot started: slot={} entries={} txs={}",
+                slot, entry_count, transaction_count
+            );
+            let started = Instant::now();
             self.process_slot_entries(slot, group);
+            on_slot_complete(slot, entry_count, transaction_count, started.elapsed());
         }
     }
 
@@ -1519,6 +1566,25 @@ impl BankReplay {
     /// advancement, and archive recording happen sequentially in original
     /// entry order after each wave executes.
     fn process_slot_entries(&self, slot: Slot, group: Vec<ReadyEntry>) {
+        let first_entry_index = group.first().map(|entry| entry.entry_index).unwrap_or(0);
+        let first_tx_start = group.first().map(|entry| entry.start_index).unwrap_or(0);
+        let transaction_count = group.iter().map(|entry| entry.tx_count).sum();
+        let first_signature = group
+            .iter()
+            .find_map(|entry| entry.txs.first())
+            .and_then(|scheduled| scheduled.tx.signatures.first())
+            .map(|signature| signature.to_string());
+        self.cursor.start_inflight(
+            slot,
+            first_entry_index,
+            first_tx_start,
+            transaction_count,
+            first_signature,
+        );
+        let _slot_inflight_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+        self.cursor.update_inflight_stage("execution_gate");
         let gate_start = Instant::now();
         let _execution_guard = self
             .execution_gate
@@ -1560,6 +1626,7 @@ impl BankReplay {
         // slots <= S-1 (same-slot extensions aren't usable until the next
         // slot), so the result is identical to sanitizing each entry just
         // before it executes. Ticks (empty entries) get an empty Vec.
+        self.cursor.update_inflight_stage("sanitize_slot");
         let phase_prepare_start = Instant::now();
         let sanitized: Vec<Vec<RuntimeTransaction<SanitizedTransaction>>> = self
             .replay_pool
@@ -1755,10 +1822,12 @@ impl BankReplay {
         let tx_positions: Vec<usize> = (0..group.len())
             .filter(|&i| group[i].tx_count > 0)
             .collect();
+        self.cursor.update_inflight_stage("build_round_footprints");
         let footprints: Vec<EntryAccounts> = tx_positions
             .iter()
             .map(|&i| entry_accounts(&sanitized[i]))
             .collect();
+        self.cursor.update_inflight_stage("assign_rounds");
         let rounds = assign_rounds(&footprints);
 
         let recording = horizon::recorder().is_some();
@@ -4010,7 +4079,7 @@ struct BankTransactionNotifier {
     target_start: Slot,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_queue: ReadyQueue,
     shutdown: Arc<AtomicBool>,
     active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     backpressure_stop_requested: Arc<AtomicBool>,
@@ -4058,7 +4127,7 @@ impl TransactionNotifier for BankTransactionNotifier {
                         self.target_tx_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
+                self.ready_queue.send_entries(&self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -4069,7 +4138,7 @@ struct BankEntryNotifier {
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_queue: ReadyQueue,
     shutdown: Arc<AtomicBool>,
     active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     backpressure_stop_requested: Arc<AtomicBool>,
@@ -4111,7 +4180,7 @@ impl EntryNotifier for BankEntryNotifier {
                 if inserted {
                     self.progress.note_entry_slot(slot);
                 }
-                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
+                self.ready_queue.send_entries(&self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -4122,7 +4191,7 @@ struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
     progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_queue: ReadyQueue,
     live_start_slot: Slot,
     shutdown: Arc<AtomicBool>,
     active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -4168,7 +4237,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             .record_block_metadata(slot, executed_transaction_count, entry_count)
         {
             Ok(ready_entries) => {
-                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
+                self.ready_queue.send_entries(&self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -4193,16 +4262,68 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
     }
 }
 
-fn send_ready_entries(
-    ready_sender: &crossbeam_channel::Sender<Vec<ReadyEntry>>,
-    failure: &ReplayFailure,
-    ready_entries: Vec<ReadyEntry>,
-) {
-    if !ready_entries.is_empty()
-        && let Err(err) = ready_sender.send(ready_entries)
-    {
-        failure.record(format!("ready entry channel closed: {err}"));
+enum ReadyQueueMessage {
+    Entries(Vec<ReadyEntry>),
+    Finish,
+}
+
+#[derive(Clone)]
+struct ReadyQueue {
+    sender: crossbeam_channel::Sender<ReadyQueueMessage>,
+    enqueued_entries: Arc<AtomicU64>,
+    processed_entries: Arc<AtomicU64>,
+}
+
+impl ReadyQueue {
+    fn send_entries(&self, failure: &ReplayFailure, ready_entries: Vec<ReadyEntry>) {
+        if ready_entries.is_empty() {
+            return;
+        }
+        let count = ready_entries.len() as u64;
+        match self.sender.send(ReadyQueueMessage::Entries(ready_entries)) {
+            Ok(()) => {
+                self.enqueued_entries.fetch_add(count, Ordering::Relaxed);
+            }
+            Err(err) => failure.record(format!("ready entry channel closed: {err}")),
+        }
     }
+
+    fn finish(&self, failure: &ReplayFailure) {
+        if let Err(err) = self.sender.send(ReadyQueueMessage::Finish) {
+            failure.record(format!("failed to finish ready entry queue: {err}"));
+        }
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        (
+            self.enqueued_entries.load(Ordering::Relaxed),
+            self.processed_entries.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Receives one coalesced unit of replay work. `None` means that the explicit
+/// finish marker was received (or every sender disappeared unexpectedly).
+fn receive_ready_batch(
+    receiver: &crossbeam_channel::Receiver<ReadyQueueMessage>,
+    coalesce_cap: usize,
+) -> Option<(Vec<ReadyEntry>, bool)> {
+    let mut entries = match receiver.recv() {
+        Ok(ReadyQueueMessage::Entries(entries)) => entries,
+        Ok(ReadyQueueMessage::Finish) | Err(_) => return None,
+    };
+    let mut finish_after_batch = false;
+    while entries.len() < coalesce_cap {
+        match receiver.try_recv() {
+            Ok(ReadyQueueMessage::Entries(more)) => entries.extend(more),
+            Ok(ReadyQueueMessage::Finish) => {
+                finish_after_batch = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Some((entries, finish_after_batch))
 }
 
 fn enforce_firehose_backpressure(
@@ -5063,6 +5184,62 @@ fn ensure_accounts_hardlinks_for_archive(
     Ok(())
 }
 
+/// Creates an independent legacy-format metadata tree for one Bank load.
+///
+/// Agave 4 upgrades legacy snapshot directories in place by writing
+/// `fastboot_version` and `storages_list` and consuming the hardlink layout.
+/// Reusing that upgraded directory later requires an `obsolete_accounts` file
+/// that the original archive did not contain. Copy only the immutable archive
+/// metadata and let Agave perform its upgrade inside this temporary directory.
+fn create_disposable_bank_snapshot(
+    ledger_dir: &Path,
+    source: &snapshot_utils::BankSnapshotInfo,
+) -> Result<(tempfile::TempDir, snapshot_utils::BankSnapshotInfo), String> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix(".snapshot-load-")
+        .tempdir_in(ledger_dir)
+        .map_err(|err| {
+            format!(
+                "failed to create disposable snapshot metadata in {}: {err}",
+                ledger_dir.display()
+            )
+        })?;
+    let snapshots_dir = temp_dir.path().join(BANK_SNAPSHOTS_DIR);
+    let snapshot_dir = snapshots_dir.join(source.slot.to_string());
+    fs::create_dir_all(&snapshot_dir)
+        .map_err(|err| format!("failed to create {}: {err}", snapshot_dir.display()))?;
+
+    for source_path in [
+        source.snapshot_path(),
+        source.snapshot_dir.join(SNAPSHOT_VERSION_FILE),
+        source.snapshot_dir.join(SNAPSHOT_STATUS_CACHE_FILE),
+    ] {
+        let file_name = source_path.file_name().ok_or_else(|| {
+            format!(
+                "snapshot metadata path has no file name: {}",
+                source_path.display()
+            )
+        })?;
+        let destination = snapshot_dir.join(file_name);
+        fs::copy(&source_path, &destination).map_err(|err| {
+            format!(
+                "failed to copy snapshot metadata {} -> {}: {err}",
+                source_path.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    let working = snapshot_utils::BankSnapshotInfo::new_from_dir(&snapshots_dir, source.slot)
+        .map_err(|err| {
+            format!(
+                "failed to open disposable bank snapshot for slot {}: {err}",
+                source.slot
+            )
+        })?;
+    Ok((temp_dir, working))
+}
+
 fn load_bank_from_snapshot(
     ledger_dir: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -5346,19 +5523,25 @@ fn load_bank_from_snapshot_archive(
         write_stage_marker(&meta_marker)?;
     }
 
-    let bank_snapshot =
-        snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir).ok_or_else(|| {
+    let source_bank_snapshot = snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir)
+        .ok_or_else(|| {
             format!(
                 "no bank snapshots found in {}",
                 bank_snapshots_dir.display()
             )
         })?;
 
-    // Replay consumes the hardlink farm and live run dirs in place
-    // (clean/shrink unlink farm entries; new appendvecs land in run/), so
-    // both are rebuilt from the pristine unpacked appendvecs on every
-    // load — that is what makes restarts safe without re-extracting. The
-    // legacy stage markers for these steps are ignored and removed.
+    let (_disposable_metadata, bank_snapshot) =
+        create_disposable_bank_snapshot(ledger_dir, &source_bank_snapshot)?;
+    info!(
+        "using disposable bank snapshot metadata at {} (source remains read-only at {})",
+        bank_snapshot.snapshot_dir.display(),
+        source_bank_snapshot.snapshot_dir.display()
+    );
+
+    // Replay consumes the disposable hardlink farm and mutable live run dirs.
+    // Rebuild both from pristine unpacked AppendVec files on every load while
+    // leaving the source Bank metadata unchanged.
     let _ = fs::remove_file(&hardlinks_marker);
     let _ = fs::remove_file(&run_paths_marker);
     let farm_start = Instant::now();
@@ -6128,19 +6311,40 @@ async fn run_geyser_replay(
     });
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
-    let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
+    let (ready_sender, ready_receiver) = bounded::<ReadyQueueMessage>(ready_queue_capacity);
+    let ready_queue = ReadyQueue {
+        sender: ready_sender,
+        enqueued_entries: Arc::new(AtomicU64::new(0)),
+        processed_entries: Arc::new(AtomicU64::new(0)),
+    };
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
+    let ready_worker_queue = ready_queue.clone();
+    let replayed_ready_transactions = Arc::new(AtomicU64::new(0));
+    let replayed_ready_slot = Arc::new(AtomicU64::new(replay_start.saturating_sub(1)));
+    let worker_replayed_transactions = replayed_ready_transactions.clone();
+    let worker_replayed_slot = replayed_ready_slot.clone();
     let ready_handle = std::thread::Builder::new()
         .name("readyEntries".to_string())
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
+            info!(
+                "replay worker started: replay_start={} queue_capacity={}",
+                replay_start, ready_queue_capacity
+            );
             // The scheduler drains ready entries per firehose notification,
             // so individual messages typically hold only a couple of
             // entries. Coalesce everything already queued before replaying
             // so slot groups span whole stretches of the slot — that is
             // what gives the wave scheduler real parallelism to exploit.
             const COALESCE_CAP: usize = 4096;
+            let replay_log_interval = env::var("JETSTREAMER_REPLAY_LOG_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(5));
+            let mut last_replay_log = Instant::now();
             loop {
                 // Time the blocking wait separately: if this dominates wall
                 // time, replay is starved by firehose input (download/decode),
@@ -6148,9 +6352,11 @@ async fn run_geyser_replay(
                 // wait is the corroborating signal — a deep queue means
                 // compute-bound, a near-empty one means input-bound.
                 let recv_start = Instant::now();
-                let mut entries = match ready_receiver.recv() {
-                    Ok(entries) => entries,
-                    Err(_) => break,
+                let Some((entries, finish_after_batch)) =
+                    receive_ready_batch(&ready_receiver, COALESCE_CAP)
+                else {
+                    info!("ready entry worker received finish; exiting");
+                    break;
                 };
                 PHASE_RECV_WAIT_US
                     .fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6159,13 +6365,82 @@ async fn run_geyser_replay(
                 if ready_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                while entries.len() < COALESCE_CAP {
-                    match ready_receiver.try_recv() {
-                        Ok(more) => entries.extend(more),
-                        Err(_) => break,
-                    }
+                let processed = entries.len() as u64;
+                let replayed_transactions = entries
+                    .iter()
+                    .map(|entry| entry.tx_count as u64)
+                    .sum::<u64>();
+                let first_slot = entries.first().map(|entry| entry.slot).unwrap_or(0);
+                let last_slot = entries.last().map(|entry| entry.slot).unwrap_or(first_slot);
+                info!(
+                    "replay batch started: slots={}..={} entries={} txs={} queue_backlog_entries={}",
+                    first_slot,
+                    last_slot,
+                    processed,
+                    replayed_transactions,
+                    ready_worker_queue
+                        .enqueued_entries
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(
+                            ready_worker_queue
+                                .processed_entries
+                                .load(Ordering::Relaxed)
+                        )
+                );
+                let replay_started = Instant::now();
+                ready_bank_replay.process_ready_entries(
+                    entries,
+                    |slot, slot_entries, slot_transactions, slot_elapsed| {
+                        let total_processed_entries = ready_worker_queue
+                            .processed_entries
+                            .fetch_add(slot_entries, Ordering::Relaxed)
+                            .saturating_add(slot_entries);
+                        let total_replayed_transactions = worker_replayed_transactions
+                            .fetch_add(slot_transactions, Ordering::Relaxed)
+                            .saturating_add(slot_transactions);
+                        worker_replayed_slot.store(slot, Ordering::Relaxed);
+                        let total_enqueued_entries = ready_worker_queue
+                            .enqueued_entries
+                            .load(Ordering::Relaxed);
+                        info!(
+                            "replay slot group complete: slot={} entries={} txs={} elapsed={:.3}s total_entries={} total_txs={} queue_backlog_entries={}",
+                            slot,
+                            slot_entries,
+                            slot_transactions,
+                            slot_elapsed.as_secs_f64(),
+                            total_processed_entries,
+                            total_replayed_transactions,
+                            total_enqueued_entries.saturating_sub(total_processed_entries)
+                        );
+                    },
+                );
+                let replay_elapsed = replay_started.elapsed();
+                let (total_enqueued_entries, total_processed_entries) =
+                    ready_worker_queue.counts();
+                let total_replayed_transactions =
+                    worker_replayed_transactions.load(Ordering::Relaxed);
+                if finish_after_batch
+                    || replay_elapsed >= Duration::from_secs(1)
+                    || last_replay_log.elapsed() >= replay_log_interval
+                {
+                    info!(
+                        "replay batch complete: slots={}..={} entries={} txs={} elapsed={:.3}s total_entries={} total_txs={} replay_slot={} queue_backlog_entries={}",
+                        first_slot,
+                        last_slot,
+                        processed,
+                        replayed_transactions,
+                        replay_elapsed.as_secs_f64(),
+                        total_processed_entries,
+                        total_replayed_transactions,
+                        last_slot,
+                        total_enqueued_entries.saturating_sub(total_processed_entries)
+                    );
+                    last_replay_log = Instant::now();
                 }
-                ready_bank_replay.process_ready_entries(entries);
+                if finish_after_batch {
+                    info!("ready entry worker drained final batch; exiting");
+                    break;
+                }
             }
         })
         .expect("failed to spawn ready entry thread");
@@ -6184,7 +6459,7 @@ async fn run_geyser_replay(
         target_start,
         scheduler: scheduler.clone(),
         failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
+        ready_queue: ready_queue.clone(),
         shutdown: shutdown.clone(),
         active_firehose_stop: active_firehose_stop.clone(),
         backpressure_stop_requested: backpressure_stop_requested.clone(),
@@ -6195,7 +6470,7 @@ async fn run_geyser_replay(
         progress: progress.clone(),
         scheduler: scheduler.clone(),
         failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
+        ready_queue: ready_queue.clone(),
         shutdown: shutdown.clone(),
         active_firehose_stop: active_firehose_stop.clone(),
         backpressure_stop_requested: backpressure_stop_requested.clone(),
@@ -6206,7 +6481,7 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         progress: progress.clone(),
         failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
+        ready_queue: ready_queue.clone(),
         live_start_slot: target_start,
         shutdown: shutdown.clone(),
         active_firehose_stop: active_firehose_stop.clone(),
@@ -6248,6 +6523,9 @@ async fn run_geyser_replay(
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
         let range_progress = range_progress.clone();
+        let progress_ready_queue = ready_queue.clone();
+        let progress_replayed_transactions = replayed_ready_transactions.clone();
+        let progress_replayed_slot = replayed_ready_slot.clone();
         std::thread::spawn(move || {
             let has_warmup = replay_start < target_start;
             let warmup_end = target_start.saturating_sub(1);
@@ -6311,6 +6589,10 @@ async fn run_geyser_replay(
                 let latest = progress.latest_slot.load(Ordering::Relaxed);
                 let tx_count = progress.tx_count.load(Ordering::Relaxed);
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
+                let replay_slot = progress_replayed_slot.load(Ordering::Relaxed);
+                let replayed_transactions = progress_replayed_transactions.load(Ordering::Relaxed);
+                let (enqueued_entries, replayed_entries) = progress_ready_queue.counts();
+                let queue_backlog_entries = enqueued_entries.saturating_sub(replayed_entries);
                 let last_account_update_slot =
                     progress.last_account_update_slot.load(Ordering::Relaxed);
                 let phase = if in_warmup && latest < target_start {
@@ -6654,7 +6936,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (target starts at {target_start})"
+                        "warmup input_slot={display_slot}/{warmup_end} ({percent:.2}%) replay_slot={replay_slot} ingested_txs={tx_count} replayed_txs={replayed_transactions} replayed_entries={replayed_entries} queue_backlog_entries={queue_backlog_entries} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (target starts at {target_start})"
                     );
                     maybe_log_phases(false);
                 } else {
@@ -6722,7 +7004,7 @@ async fn run_geyser_replay(
                         .map(jetstreamer_firehose::system::format_byte_size)
                         .unwrap_or_else(|| "n/a".to_string());
                     info!(
-                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size} mem={anon_rss}"
+                        "pipeline progress input_slot={display_slot}/{end_inclusive} ({percent:.2}%) replay_slot={replay_slot} ingested_txs={tx_count} replayed_txs={replayed_transactions} replayed_entries={replayed_entries} queue_backlog_entries={queue_backlog_entries} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size} mem={anon_rss}"
                     );
                     // Overall span progress + ETA across the whole multi-epoch
                     // run, on its own line. The rate baseline is captured once
@@ -6863,7 +7145,7 @@ async fn run_geyser_replay(
 
         match scheduler.drain_ready_entries() {
             Ok(ready_entries) => {
-                send_ready_entries(&ready_sender, &failure, ready_entries);
+                ready_queue.send_entries(&failure, ready_entries);
             }
             Err(err) => failure.record(err),
         }
@@ -6891,7 +7173,7 @@ async fn run_geyser_replay(
                     );
                     match scheduler.force_mark_missing(incomplete.slot) {
                         Ok(ready_entries) => {
-                            send_ready_entries(&ready_sender, &failure, ready_entries);
+                            ready_queue.send_entries(&failure, ready_entries);
                             persistent_missing_slot = None;
                             persistent_missing_count = 0;
                             firehose_start = scheduler.snapshot().current_slot;
@@ -6954,18 +7236,47 @@ async fn run_geyser_replay(
         }
         break;
     }
-    progress_done.store(true, Ordering::Relaxed);
-    let _ = progress_handle.join();
     if let Some(err) = firehose_error {
         failure.record(err);
     }
     drop(transaction_notifier);
     drop(entry_notifier);
     drop(block_metadata_notifier);
-    // Drop the notifier bundle too; it holds Arc clones that keep ready_sender alive.
+    // Firehose producers have joined and the scheduler has dispatched every
+    // ready entry. Tell the replay worker to drain and exit explicitly; sender
+    // clones no longer control shutdown.
     drop(notifiers);
-    drop(ready_sender);
-    let _ = ready_handle.join();
+    let (enqueued_before_finish, processed_before_finish) = ready_queue.counts();
+    info!(
+        "finishing ready entry queue: enqueued_entries={} processed_entries={} backlog_entries={}",
+        enqueued_before_finish,
+        processed_before_finish,
+        enqueued_before_finish.saturating_sub(processed_before_finish)
+    );
+    ready_queue.finish(&failure);
+    if ready_handle.join().is_err() {
+        failure.record("ready entry worker panicked".to_string());
+    }
+    let (enqueued_entries, processed_entries) = ready_queue.counts();
+    let replayed_transactions = replayed_ready_transactions.load(Ordering::Relaxed);
+    let replay_slot = replayed_ready_slot.load(Ordering::Relaxed);
+    let replay_bank_slot = bank_replay
+        .bank_forks
+        .read()
+        .ok()
+        .map(|guard| guard.working_bank().slot())
+        .unwrap_or(0);
+    info!(
+        "ready entry queue drained: enqueued_entries={} replayed_entries={} replayed_txs={} replay_slot={} bank_slot={}",
+        enqueued_entries, processed_entries, replayed_transactions, replay_slot, replay_bank_slot
+    );
+    if enqueued_entries != processed_entries && !shutdown.load(Ordering::Relaxed) {
+        failure.record(format!(
+            "ready entry queue mismatch: enqueued {enqueued_entries} entries, processed {processed_entries}"
+        ));
+    }
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
     if let Err(err) = scheduler.verify_complete(end_inclusive) {
         failure.record(err);
     }
@@ -7973,9 +8284,15 @@ async fn main() {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{EntryAccounts, SlotReplayRange, assign_rounds, parse_slot_replay_range};
+    use super::{
+        BANK_SNAPSHOTS_DIR, EntryAccounts, ReadyEntry, ReadyQueueMessage,
+        SNAPSHOT_STATUS_CACHE_FILE, SNAPSHOT_VERSION_FILE, SlotReplayRange, assign_rounds,
+        create_disposable_bank_snapshot, parse_slot_replay_range, receive_ready_batch,
+    };
     use solana_address::Address;
-    use std::collections::HashSet;
+    use solana_hash::Hash;
+    use solana_runtime::snapshot_utils;
+    use std::{collections::HashSet, fs};
 
     fn addr(byte: u8) -> Address {
         Address::new_from_array([byte; 32])
@@ -8006,6 +8323,77 @@ mod scheduler_tests {
         assert!(parse_slot_replay_range("0:1").is_err());
         assert!(parse_slot_replay_range("10:9").is_err());
         assert!(parse_slot_replay_range("431999:432000").is_err());
+    }
+
+    #[test]
+    fn explicit_finish_ends_ready_worker_with_sender_clone_alive() {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let retained_sender = sender.clone();
+        let worker = std::thread::spawn(move || receive_ready_batch(&receiver, 4096).is_none());
+
+        sender.send(ReadyQueueMessage::Finish).unwrap();
+        assert!(worker.join().unwrap());
+
+        // The old implementation waited for every sender to disappear and
+        // deadlocked here. The explicit marker must win over sender lifetime.
+        drop(retained_sender);
+    }
+
+    #[test]
+    fn explicit_finish_preserves_entries_queued_before_it() {
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        sender
+            .send(ReadyQueueMessage::Entries(vec![ReadyEntry {
+                slot: 42,
+                entry_index: 0,
+                start_index: 0,
+                txs: Vec::new(),
+                hash: Hash::default(),
+                num_hashes: 1,
+                tx_count: 0,
+            }]))
+            .unwrap();
+        sender.send(ReadyQueueMessage::Finish).unwrap();
+
+        let (entries, finish_after_batch) = receive_ready_batch(&receiver, 4096).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].slot, 42);
+        assert!(finish_after_batch);
+    }
+
+    #[test]
+    fn disposable_snapshot_metadata_ignores_incomplete_fastboot_state() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshots_dir = root.path().join(BANK_SNAPSHOTS_DIR);
+        let slot = 441851483;
+        let source_dir = snapshots_dir.join(slot.to_string());
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join(slot.to_string()), b"source-bank").unwrap();
+        fs::write(source_dir.join(SNAPSHOT_VERSION_FILE), b"1.2.0").unwrap();
+        fs::write(
+            source_dir.join(SNAPSHOT_STATUS_CACHE_FILE),
+            b"source-status",
+        )
+        .unwrap();
+        fs::write(source_dir.join("fastboot_version"), b"3.0.0").unwrap();
+        fs::write(source_dir.join("storages_list"), b"generated-state").unwrap();
+        // Deliberately omit `obsolete_accounts`: this is the broken state
+        // produced by reusing an in-place-upgraded legacy extraction.
+
+        let source = snapshot_utils::BankSnapshotInfo::new_from_dir(&snapshots_dir, slot).unwrap();
+        let (disposable_dir, working) =
+            create_disposable_bank_snapshot(root.path(), &source).unwrap();
+
+        assert!(source.fastboot_version.is_some());
+        assert!(working.fastboot_version.is_none());
+        assert_eq!(fs::read(working.snapshot_path()).unwrap(), b"source-bank");
+        assert!(!working.snapshot_dir.join("fastboot_version").exists());
+        assert!(!working.snapshot_dir.join("storages_list").exists());
+        assert_eq!(fs::read(source.snapshot_path()).unwrap(), b"source-bank");
+
+        let disposable_path = disposable_dir.path().to_path_buf();
+        drop(disposable_dir);
+        assert!(!disposable_path.exists());
     }
 
     /// Flattens rounds back to (entry_index -> round_index) for assertions.
@@ -8080,6 +8468,19 @@ mod scheduler_tests {
         let rounds = assign_rounds(&entries);
         assert_eq!(rounds.len(), 3);
         check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn hot_account_chain_plans_without_repeated_scans() {
+        let entries = vec![entry(&[1], &[]); 10_000];
+        let rounds = assign_rounds(&entries);
+        assert_eq!(rounds.len(), entries.len());
+        assert!(
+            rounds
+                .iter()
+                .enumerate()
+                .all(|(index, round)| round.as_slice() == [index])
+        );
     }
 
     #[test]
