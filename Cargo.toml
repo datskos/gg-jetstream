@@ -172,6 +172,7 @@ codegen-units = 1
 # lencode 1.2.1 still pins the Solana 3 type graph. This copy uses its upstream
 # v4 adapter from 7a0b1ea4acacaf31f1391d60ba32e4ae01373a8c with Agave 4.2 constraints.
 lencode = { path = "vendor/lencode" }
-solana-program-runtime = { path = "vendor/solana-program-runtime" }
-solana-svm = { path = "vendor/solana-svm" }
+# Keep solana-program-runtime and solana-svm on the official 4.2.0 crates.
+# Jetstreamer's former overrides violated cooperative loading's single-owner
+# invariant when replay executed multiple transaction batches concurrently.
 solana-runtime = { path = "vendor/solana-runtime-4.2.0" }

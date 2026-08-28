@@ -9551,6 +9551,8 @@ dependencies = [
 [[package]]
 name = "solana-program-runtime"
 version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c42afb4ff05212f641c91d8c731817a135e0a9a5d88a45af14f324ae8490ea0b"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -10477,6 +10479,8 @@ dependencies = [
 [[package]]
 name = "solana-svm"
 version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b108fa25f3c3856d6c3192afaec1841c820bfb7e1bf4711cbf35a51cbd85bccd"
 dependencies = [
  "ahash 0.8.12",
  "log",
