@@ -285,7 +285,7 @@ struct BufferedBlockMeta {
     parent_slot: Slot,
     parent_blockhash: Hash,
     blockhash: Hash,
-    rewards: Vec<(Address, solana_reward_info::RewardInfo)>,
+    rewards: Vec<(Address, solana_runtime::bank::RewardInfo)>,
     num_partitions: Option<u64>,
     block_time: Option<i64>,
     block_height: Option<u64>,
@@ -780,7 +780,13 @@ impl RecorderState {
         meta.num_partitions = block_meta.num_partitions;
         for (pubkey, info) in &block_meta.rewards {
             meta.rewards
-                .try_push(convert::reward_from_info(*pubkey, info))
+                .try_push(convert::reward_from_info(
+                    *pubkey,
+                    info.reward_type,
+                    info.lamports,
+                    info.post_balance,
+                    info.commission_bps,
+                ))
                 .unwrap_or_else(|_| {
                     panic!(
                         "horizon: block rewards overflow at slot {slot} ({} rewards)",
@@ -961,11 +967,11 @@ mod tests {
             &KeyedRewardsAndNumPartitions {
                 keyed_rewards: vec![(
                     pk(9),
-                    solana_reward_info::RewardInfo {
+                    solana_runtime::bank::RewardInfo {
                         reward_type: solana_reward_info::RewardType::Voting,
                         lamports: 10,
                         post_balance: 100,
-                        commission: Some(5),
+                        commission_bps: Some(500),
                     },
                 )],
                 num_partitions: Some(7),

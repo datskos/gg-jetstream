@@ -43,6 +43,7 @@ impl PluginWorker for PubkeyStatsWorker {
         let keys = match &tx.message {
             VersionedMessage::Legacy(m) => m.account_keys.as_slice(),
             VersionedMessage::V0(m) => m.account_keys.as_slice(),
+            VersionedMessage::V1(m) => m.account_keys.as_slice(),
         };
         if keys.is_empty() {
             return;

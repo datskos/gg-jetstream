@@ -43,7 +43,7 @@ use serde_cbor::Value;
 use solana_account::AccountSharedData;
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig,
-    accounts_index::{AccountsIndexConfig, IndexLimitMb},
+    accounts_index::{AccountsIndexConfig, IndexLimit},
     accounts_update_notifier_interface::{
         AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
     },
@@ -525,7 +525,6 @@ fn execute_entry_batch(
     let mut timings = ExecuteTimings::default();
     let (commit_results, _balance_collector) = bank.load_execute_and_commit_transactions(
         batch,
-        MAX_PROCESSING_AGE,
         ExecutionRecordingConfig::new_single_setting(false),
         &mut timings,
         None,
@@ -590,7 +589,7 @@ impl BankReplay {
         accounts_maintenance_root_stride: u64,
     ) -> Self {
         // Ensure program cache respects deployment slots during replay.
-        bank.set_check_program_modification_slot(true);
+        bank.set_check_program_deployment_slot(true);
         let bank_forks = BankForks::new_rw_arc(bank);
         Self::from_bank_forks(
             bank_forks,
@@ -626,7 +625,7 @@ impl BankReplay {
         enable_accounts_maintenance: bool,
         accounts_maintenance_root_stride: u64,
     ) -> Self {
-        let (mut leader_schedule_cache, cached_bank) = {
+        let (leader_schedule_cache, cached_bank) = {
             let guard = bank_forks
                 .read()
                 .expect("bank forks lock poisoned during init");
@@ -638,7 +637,6 @@ impl BankReplay {
             }));
             (leader_schedule_cache, cached_bank)
         };
-        leader_schedule_cache.set_max_schedules(usize::MAX);
         let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
             .ok()
             .and_then(|value| Signature::from_str(value.trim()).ok());
@@ -654,16 +652,17 @@ impl BankReplay {
         // fallback path in `note_account_update`. Schedulers are checked out
         // of the pool per slot rather than attached at bank insert, keeping
         // bank-forks bookkeeping identical across all three modes.
-        let unified_pool = (scheduler_mode == SchedulerMode::Unified).then(|| {
-            info!("unified scheduler pool created (handlers={replay_threads})");
-            DefaultSchedulerPool::new_dyn(
-                Some(replay_threads),
-                None,
-                None,
-                None,
-                Arc::new(PrioritizationFeeCache::default()),
-            )
-        });
+        let unified_pool: Option<InstalledSchedulerPoolArc> =
+            (scheduler_mode == SchedulerMode::Unified).then(|| {
+                info!("unified scheduler pool created (handlers={replay_threads})");
+                DefaultSchedulerPool::new(
+                    Some(replay_threads),
+                    None,
+                    None,
+                    None,
+                    Some(Arc::new(PrioritizationFeeCache::default())),
+                ) as InstalledSchedulerPoolArc
+            });
         let replay_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(replay_threads)
             .thread_name(|i| format!("replayExec{i:02}"))
@@ -773,12 +772,12 @@ impl BankReplay {
             let collector_id = self
                 .leader_schedule_cache
                 .slot_leader_at(slot, Some(&parent))
-                .unwrap_or_else(|| *parent.collector_id());
+                .unwrap_or_else(|| *parent.leader());
             self.cursor.update_inflight_stage("new_from_parent");
-            let mut next_bank = Bank::new_from_parent(parent, &collector_id, slot);
-            next_bank.set_check_program_modification_slot(true);
+            let mut next_bank = Bank::new_from_parent(parent, collector_id, slot);
+            next_bank.set_check_program_deployment_slot(true);
             self.cursor.update_inflight_stage("set_alpenglow_ticks");
-            set_alpenglow_ticks(&next_bank);
+            set_alpenglow_ticks(&next_bank, &guard.migration_status());
             self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval
@@ -945,13 +944,9 @@ impl BankReplay {
                         let bank_forks = Arc::clone(&bank_forks);
                         std::thread::spawn(move || {
                             let mut last_progress = Instant::now();
-                            let bank = loop {
+                            let bank_forks_guard = loop {
                                 match bank_forks.try_read() {
-                                    Ok(guard) => {
-                                        let bank = guard.get(prune_slot);
-                                        drop(guard);
-                                        break bank;
-                                    }
+                                    Ok(guard) => break guard,
                                     Err(_) => {
                                         if last_progress.elapsed()
                                             >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
@@ -966,6 +961,7 @@ impl BankReplay {
                                     }
                                 }
                             };
+                            let bank = bank_forks_guard.get(prune_slot);
                             let Some(bank) = bank else {
                                 warn!(
                                     "bank_for_slot program cache prune skipped: missing root bank slot {}",
@@ -980,7 +976,7 @@ impl BankReplay {
                                 prune_slot
                             );
                             let rss_before = read_rss_bytes();
-                            bank.prune_program_cache(prune_slot, bank.epoch());
+                            bank.prune_program_cache(&bank_forks_guard);
                             let rss_after = read_rss_bytes();
                             let rss_saved = match (rss_before, rss_after) {
                                 (Some(before), Some(after)) if before > after => {
@@ -1145,6 +1141,7 @@ impl BankReplay {
         let version = match message {
             VersionedMessage::Legacy(_) => "legacy",
             VersionedMessage::V0(_) => "v0",
+            VersionedMessage::V1(_) => "v1",
         };
         let header = message.header();
         let static_keys = message.static_account_keys();
@@ -1209,7 +1206,8 @@ impl BankReplay {
 
         for (index, key) in static_keys.iter().enumerate() {
             let signer = message.is_signer(index);
-            let writable = message.is_maybe_writable(index, None);
+            let writable =
+                message.is_maybe_writable_with_reserved_addresses(index, None::<&HashSet<Address>>);
             let invoked = message.is_invoked(index);
             warn!(
                 "mismatch detail: key[{}]={} signer={} writable={} invoked_as_program={} source=static",
@@ -1313,6 +1311,7 @@ impl BankReplay {
             let version = match message {
                 VersionedMessage::Legacy(_) => "legacy",
                 VersionedMessage::V0(_) => "v0",
+                VersionedMessage::V1(_) => "v1",
             };
             let header = message.header();
             let static_keys = message.static_account_keys();
@@ -1324,7 +1323,10 @@ impl BankReplay {
                         "index": index,
                         "key": key.to_string(),
                         "signer": message.is_signer(index),
-                        "writable": message.is_maybe_writable(index, None),
+                        "writable": message.is_maybe_writable_with_reserved_addresses(
+                            index,
+                            None::<&HashSet<Address>>,
+                        ),
                         "invoked_as_program": message.is_invoked(index),
                         "source": "static",
                     })
@@ -4134,6 +4136,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         _block_height: Option<u64>,
         executed_transaction_count: u64,
         entry_count: u64,
+        _commission_rate_in_basis_points: bool,
     ) {
         if slot == u64::MAX {
             return;
@@ -5046,6 +5049,7 @@ fn load_bank_from_snapshot(
         &genesis_config,
         &runtime_config,
         None,
+        None,
         limit_load_slot_count_from_snapshot,
         false,
         accounts_db_config,
@@ -5141,7 +5145,7 @@ fn load_bank_from_snapshot_archive(
         reset_dir(&account_run_dir)?;
     }
     if !unpack_done {
-        let (sender, receiver) = unbounded::<PathBuf>();
+        let (sender, receiver) = unbounded::<agave_fs::FileInfo>();
         let log_interval = env::var("JETSTREAMER_SNAPSHOT_UNPACK_LOG_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -5194,7 +5198,7 @@ fn load_bank_from_snapshot_archive(
                     } else {
                         0.0
                     };
-                    let last_display = path.display().to_string();
+                    let last_display = path.path.display().to_string();
                     if let Some(total) = total_entries {
                         let percent = if total > 0 {
                             (count as f64 * 100.0 / total as f64).min(100.0)
@@ -5233,17 +5237,20 @@ fn load_bank_from_snapshot_archive(
                 }
             }
         });
-        let handle = streaming_unarchive_snapshot(
-            sender,
-            vec![account_run_dir.clone()],
-            unpack_dir.clone(),
-            snapshot_archive.to_path_buf(),
-            full_snapshot.archive_format(),
-            0,
-        );
-        let result = handle
+        let io_setup = Default::default();
+        let result = std::thread::scope(|scope| {
+            streaming_unarchive_snapshot(
+                scope,
+                sender,
+                vec![account_run_dir.clone()],
+                unpack_dir.clone(),
+                snapshot_archive.to_path_buf(),
+                full_snapshot.archive_format(),
+                &io_setup,
+            )
             .join()
-            .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
+            .map_err(|_| "snapshot unarchive thread panicked".to_string())
+        })?;
         result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
         let _ = drain.join();
         write_stage_marker(&unpack_marker)?;
@@ -5305,6 +5312,7 @@ fn load_bank_from_snapshot_archive(
         &genesis_config,
         &runtime_config,
         None,
+        None,
         limit_load_slot_count_from_snapshot,
         false,
         accounts_db_config,
@@ -5349,7 +5357,7 @@ fn accounts_db_config_for_ledger(ledger_dir: &Path) -> Result<AccountsDbConfig, 
 
     let accounts_index_config = AccountsIndexConfig {
         drives: Some(vec![index_path]),
-        index_limit_mb: IndexLimitMb::Minimal,
+        index_limit: IndexLimit::Minimal,
         ..AccountsIndexConfig::default()
     };
 
@@ -6906,19 +6914,22 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
             .map_err(|err| format!("failed to create {}: {err}", account_path.display()))?;
 
         if let Ok(archive_info) = FullSnapshotArchiveInfo::new_from_path(archive.clone()) {
-            let (sender, receiver) = unbounded();
+            let (sender, receiver) = unbounded::<agave_fs::FileInfo>();
             let drain = std::thread::spawn(move || for _ in receiver.iter() {});
-            let handle = streaming_unarchive_snapshot(
-                sender,
-                vec![account_path],
-                dest_dir.clone(),
-                archive,
-                archive_info.archive_format(),
-                0,
-            );
-            let result = handle
+            let io_setup = Default::default();
+            let result = std::thread::scope(|scope| {
+                streaming_unarchive_snapshot(
+                    scope,
+                    sender,
+                    vec![account_path],
+                    dest_dir.clone(),
+                    archive,
+                    archive_info.archive_format(),
+                    &io_setup,
+                )
                 .join()
-                .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
+                .map_err(|_| "snapshot unarchive thread panicked".to_string())
+            })?;
             result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
             let _ = drain.join();
             Ok(())

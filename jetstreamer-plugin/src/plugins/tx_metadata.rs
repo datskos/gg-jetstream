@@ -54,6 +54,15 @@ pub(crate) struct MessageHeaderView {
     pub(crate) num_readonly_unsigned_accounts: u8,
 }
 
+/// Borrowed-by-value compute budget fields carried directly by V1 messages.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct V1TransactionConfigView {
+    pub(crate) priority_fee: Option<u64>,
+    pub(crate) compute_unit_limit: Option<u32>,
+    pub(crate) loaded_accounts_data_size_limit: Option<u32>,
+    pub(crate) heap_size: Option<u32>,
+}
+
 /// Borrowed resolved-account view in Solana's canonical order: static keys,
 /// loaded writable keys, then loaded readonly keys.
 #[derive(Clone, Copy)]
@@ -111,6 +120,7 @@ pub(crate) struct TxMetadataInput<'a> {
     pub(crate) num_signatures: usize,
     pub(crate) header: MessageHeaderView,
     pub(crate) is_legacy: bool,
+    pub(crate) v1_config: Option<V1TransactionConfigView>,
     pub(crate) fee: u64,
     pub(crate) compute_units_consumed: Option<u64>,
     pub(crate) is_success: bool,
@@ -133,6 +143,7 @@ where
         num_signatures,
         header,
         is_legacy,
+        v1_config,
         fee,
         compute_units_consumed,
         is_success,
@@ -143,6 +154,7 @@ where
         num_signatures,
         header,
         is_legacy,
+        v1_config,
         accounts,
         instructions.clone(),
     );
@@ -172,7 +184,9 @@ where
         };
     }
 
-    let mut cu_limit = None;
+    let mut cu_limit = v1_config
+        .and_then(|config| config.compute_unit_limit)
+        .map(u64::from);
     let mut cu_price = None;
     let mut num_ixs = 0u16;
     let mut num_ixs_builtin = 0u16;
@@ -187,7 +201,7 @@ where
             num_ixs_builtin = num_ixs_builtin.saturating_add(1);
         }
 
-        if program == &solana_sdk_ids::compute_budget::id() {
+        if v1_config.is_none() && program == &solana_sdk_ids::compute_budget::id() {
             match ix.data {
                 [2, a, b, c, d] => {
                     cu_limit = Some(u32::from_le_bytes([*a, *b, *c, *d]) as u64);
@@ -240,6 +254,17 @@ fn row_from_firehose(transaction: &TransactionData) -> TxMetadataRow {
         &meta.loaded_addresses.writable,
         &meta.loaded_addresses.readonly,
     );
+    let v1_config = match message {
+        solana_message::VersionedMessage::V1(message) => Some(V1TransactionConfigView {
+            priority_fee: message.config.priority_fee,
+            compute_unit_limit: message.config.compute_unit_limit,
+            loaded_accounts_data_size_limit: message.config.loaded_accounts_data_size_limit,
+            heap_size: message.config.heap_size,
+        }),
+        solana_message::VersionedMessage::Legacy(_) | solana_message::VersionedMessage::V0(_) => {
+            None
+        }
+    };
 
     parse_tx_metadata(
         TxMetadataInput {
@@ -252,6 +277,7 @@ fn row_from_firehose(transaction: &TransactionData) -> TxMetadataRow {
                 num_readonly_unsigned_accounts: header.num_readonly_unsigned_accounts,
             },
             is_legacy: matches!(message, solana_message::VersionedMessage::Legacy(_)),
+            v1_config,
             fee: meta.fee,
             compute_units_consumed: meta.compute_units_consumed,
             is_success: meta.status.is_ok(),
@@ -519,6 +545,7 @@ mod tests {
                     num_readonly_unsigned_accounts: 1,
                 },
                 is_legacy: true,
+                v1_config: None,
                 fee: 15_123,
                 compute_units_consumed: Some(321),
                 is_success: true,
@@ -592,6 +619,7 @@ mod tests {
                     num_readonly_unsigned_accounts: message.header.num_readonly_unsigned_accounts,
                 },
                 is_legacy: true,
+                v1_config: None,
                 fee: 105_000,
                 compute_units_consumed: Some(50_000),
                 is_success: true,
@@ -635,6 +663,7 @@ mod tests {
                     num_readonly_unsigned_accounts: 1,
                 },
                 is_legacy: true,
+                v1_config: None,
                 fee: 8_000,
                 compute_units_consumed: None,
                 is_success: true,
@@ -667,6 +696,7 @@ mod tests {
                     num_readonly_unsigned_accounts: 0,
                 },
                 is_legacy: false,
+                v1_config: None,
                 fee: 5_000,
                 compute_units_consumed: None,
                 is_success: true,
@@ -694,6 +724,7 @@ mod tests {
                     num_readonly_unsigned_accounts: 1,
                 },
                 is_legacy: true,
+                v1_config: None,
                 fee: 5_000,
                 compute_units_consumed: None,
                 is_success: false,
@@ -720,6 +751,7 @@ mod tests {
                     num_readonly_unsigned_accounts: 1,
                 },
                 is_legacy: true,
+                v1_config: None,
                 fee: 99_999,
                 compute_units_consumed: Some(999_999),
                 is_success: false,
@@ -744,5 +776,51 @@ mod tests {
         assert!(!row.is_success);
         assert_eq!(row.num_ixs, 1);
         assert_eq!(row.num_ixs_builtin, 1);
+    }
+
+    #[test]
+    fn v1_config_drives_metadata_and_scheduler_metrics() {
+        let keys = [
+            Address::new_from_array([1; 32]),
+            Address::new_from_array([2; 32]),
+        ];
+        let instruction_data = [1, 2, 3];
+        let row = parse_tx_metadata(
+            TxMetadataInput {
+                slot: 1,
+                tx_idx: 0,
+                num_signatures: 1,
+                header: MessageHeaderView {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                is_legacy: false,
+                v1_config: Some(V1TransactionConfigView {
+                    priority_fee: Some(100_000),
+                    compute_unit_limit: Some(100_000),
+                    loaded_accounts_data_size_limit: Some(64 * 1024),
+                    heap_size: None,
+                }),
+                fee: 105_000,
+                compute_units_consumed: Some(50_000),
+                is_success: true,
+                accounts: ResolvedAccounts::new(&keys, &[], &[]),
+            },
+            [ix(1, &instruction_data)],
+        );
+
+        // V1 carries a direct priority fee and compute-unit limit. Its 64 KiB
+        // loaded-account cap adds two account-data pages to the cost.
+        let expected_cost = 101_036;
+        let scheduler_reward = 100_000_u64 + 2_500;
+        assert_eq!(row.cu_limit, Some(100_000));
+        assert_eq!(row.cu_price, None);
+        assert_eq!(row.prio_fee, 100_000);
+        assert_eq!(row.scheduler_cost_units, Some(expected_cost));
+        assert_eq!(
+            row.scheduler_priority,
+            Some(scheduler_reward.saturating_mul(1_000_000) / (expected_cost + 1))
+        );
     }
 }

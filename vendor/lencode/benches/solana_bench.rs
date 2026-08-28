@@ -1,0 +1,600 @@
+#![cfg(all(feature = "solana", feature = "std"))]
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use lencode::prelude::*;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{RngExt, SeedableRng};
+use serde::{Deserialize, Serialize};
+use solana_message::compiled_instruction::CompiledInstruction;
+use solana_pubkey::Pubkey;
+use std::hint::black_box;
+use std::io::Cursor;
+use wincode::{SchemaRead, SchemaReadOwned, SchemaWrite, io::Cursor as WincodeCursor};
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Pack,
+    Serialize,
+    Deserialize,
+    SchemaWrite,
+    SchemaRead,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+#[repr(transparent)]
+struct BenchPubkey([u8; 32]);
+
+impl From<Pubkey> for BenchPubkey {
+    fn from(value: Pubkey) -> Self {
+        Self(value.to_bytes())
+    }
+}
+
+impl DedupeEncodeable for BenchPubkey {
+    type Hasher = DefaultDedupeHasher;
+}
+impl DedupeDecodeable for BenchPubkey {
+    type Hasher = DefaultDedupeHasher;
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    SchemaWrite,
+    SchemaRead,
+    Encode,
+    Decode,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+struct BenchCompiledInstruction {
+    program_id_index: u8,
+    #[serde(with = "solana_short_vec")]
+    #[wincode(with = "wincode::containers::Vec<_, wincode::len::ShortU16Len>")]
+    accounts: Vec<u8>,
+    #[serde(with = "solana_short_vec")]
+    #[wincode(with = "wincode::containers::Vec<_, wincode::len::ShortU16Len>")]
+    data: Vec<u8>,
+}
+
+impl From<&CompiledInstruction> for BenchCompiledInstruction {
+    fn from(value: &CompiledInstruction) -> Self {
+        Self {
+            program_id_index: value.program_id_index,
+            accounts: value.accounts.clone(),
+            data: value.data.clone(),
+        }
+    }
+}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    SchemaWrite,
+    SchemaRead,
+    Encode,
+    Decode,
+    BorshSerialize,
+    BorshDeserialize,
+)]
+struct BenchMessage {
+    #[serde(with = "solana_short_vec")]
+    #[wincode(with = "wincode::containers::Vec<_, wincode::len::ShortU16Len>")]
+    account_keys: Vec<BenchPubkey>,
+    recent_blockhash: [u8; 32],
+    #[serde(with = "solana_short_vec")]
+    #[wincode(with = "wincode::containers::Vec<_, wincode::len::ShortU16Len>")]
+    instructions: Vec<BenchCompiledInstruction>,
+}
+
+#[inline(always)]
+fn encode_lencode_into<T: Encode>(value: &T, writer: &mut lencode::io::VecWriter) {
+    value.encode_ext(writer, None).unwrap();
+}
+
+#[inline(always)]
+fn encode_lencode<T: Encode>(value: &T) -> Vec<u8> {
+    let mut writer = lencode::io::VecWriter::new();
+    encode_lencode_into(value, &mut writer);
+    writer.into_inner()
+}
+
+#[inline(always)]
+fn encode_lencode_dedupe_into<T: Encode>(
+    value: &T,
+    ctx: &mut EncoderContext,
+    writer: &mut lencode::io::VecWriter,
+) {
+    value.encode_ext(writer, Some(ctx)).unwrap();
+}
+
+#[inline(always)]
+fn encode_lencode_dedupe<T: Encode>(value: &T, ctx: &mut EncoderContext) -> Vec<u8> {
+    let mut writer = lencode::io::VecWriter::new();
+    encode_lencode_dedupe_into(value, ctx, &mut writer);
+    writer.into_inner()
+}
+
+#[inline(always)]
+fn decode_lencode<T: Decode>(bytes: &[u8]) -> T {
+    let mut cursor = lencode::io::Cursor::new(bytes);
+    T::decode_ext(&mut cursor, None).unwrap()
+}
+
+#[inline(always)]
+fn decode_lencode_dedupe<T: Decode>(bytes: &[u8], ctx: &mut DecoderContext) -> T {
+    let mut cursor = lencode::io::Cursor::new(bytes);
+    T::decode_ext(&mut cursor, Some(ctx)).unwrap()
+}
+
+#[inline(always)]
+fn encode_bincode_into<T: Serialize>(value: &T, cursor: &mut Cursor<Vec<u8>>) {
+    bincode::serde::encode_into_std_write(value, cursor, bincode::config::standard()).unwrap();
+}
+
+#[inline(always)]
+fn encode_bincode<T: Serialize>(value: &T) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    encode_bincode_into(value, &mut cursor);
+    cursor.into_inner()
+}
+
+#[inline(always)]
+fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+    let mut cursor = Cursor::new(bytes);
+    bincode::serde::decode_from_std_read(&mut cursor, bincode::config::standard()).unwrap()
+}
+
+#[inline(always)]
+fn encode_borsh_into<T: BorshSerialize>(value: &T, cursor: &mut Cursor<Vec<u8>>) {
+    value.serialize(cursor).unwrap();
+}
+
+#[inline(always)]
+fn encode_borsh<T: BorshSerialize>(value: &T) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    encode_borsh_into(value, &mut cursor);
+    cursor.into_inner()
+}
+
+#[inline(always)]
+fn decode_borsh<T: BorshDeserialize>(bytes: &[u8]) -> T {
+    let mut cursor = Cursor::new(bytes);
+    T::deserialize_reader(&mut cursor).unwrap()
+}
+
+#[inline(always)]
+fn encode_wincode_into<T: SchemaWrite<Src = T>>(value: &T, writer: &mut impl wincode::io::Writer) {
+    wincode::serialize_into(writer, value).unwrap();
+}
+
+#[inline(always)]
+fn encode_wincode<T: SchemaWrite<Src = T>>(value: &T) -> Vec<u8> {
+    wincode::serialize(value).unwrap()
+}
+
+#[inline(always)]
+fn decode_wincode<T>(bytes: &[u8]) -> T
+where
+    T: SchemaReadOwned<Dst = T>,
+{
+    wincode::deserialize(bytes).unwrap()
+}
+
+fn bench_codec<T>(c: &mut Criterion, name: &str, value: &T)
+where
+    T: Encode
+        + Decode
+        + Serialize
+        + serde::de::DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
+        + SchemaWrite<Src = T>
+        + SchemaReadOwned<Dst = T>
+        + for<'de> SchemaRead<'de, Dst = T>,
+{
+    let mut group = c.comparison_benchmark_group(format!("{name}_encode"));
+    group.bench_function("lencode", |b| {
+        b.iter_batched(
+            lencode::io::VecWriter::new,
+            |mut writer| {
+                encode_lencode_into(value, &mut writer);
+                black_box(writer.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("bincode", |b| {
+        b.iter_batched(
+            || Cursor::new(Vec::new()),
+            |mut cursor| {
+                encode_bincode_into(value, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("borsh", |b| {
+        b.iter_batched(
+            || Cursor::new(Vec::new()),
+            |mut cursor| {
+                encode_borsh_into(value, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("wincode", |b| {
+        b.iter_batched(
+            || WincodeCursor::new(Vec::new()),
+            |mut cursor| {
+                encode_wincode_into(value, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+
+    let lencode_bytes = encode_lencode(value);
+    let bincode_bytes = encode_bincode(value);
+    let borsh_bytes = encode_borsh(value);
+    let wincode_bytes = encode_wincode(value);
+
+    let mut group = c.comparison_benchmark_group(format!("{name}_decode"));
+    group.bench_function("lencode", |b| {
+        b.iter(|| black_box(decode_lencode::<T>(&lencode_bytes)))
+    });
+    group.bench_function("bincode", |b| {
+        b.iter(|| black_box(decode_bincode::<T>(&bincode_bytes)))
+    });
+    group.bench_function("borsh", |b| {
+        b.iter(|| black_box(decode_borsh::<T>(&borsh_bytes)))
+    });
+    group.bench_function("wincode", |b| {
+        b.iter(|| black_box(decode_wincode::<T>(&wincode_bytes)))
+    });
+    group.finish();
+
+    println!(
+        "[size] {name}: lencode={} bincode={} borsh={} wincode={}",
+        lencode_bytes.len(),
+        bincode_bytes.len(),
+        borsh_bytes.len(),
+        wincode_bytes.len()
+    );
+}
+
+fn make_pubkeys(rng: &mut StdRng, count: usize) -> Vec<BenchPubkey> {
+    (0..count)
+        .map(|_| {
+            let bytes: [u8; 32] = rng.random();
+            let pubkey = Pubkey::new_from_array(bytes);
+            BenchPubkey::from(pubkey)
+        })
+        .collect()
+}
+
+fn make_pubkeys_with_hotset_from(
+    rng: &mut StdRng,
+    count: usize,
+    hotset: &[BenchPubkey],
+    hotset_pct: u8,
+) -> Vec<BenchPubkey> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if rng.random_range(0..100) < hotset_pct {
+            let idx = rng.random_range(0..hotset.len());
+            out.push(hotset[idx].clone());
+        } else {
+            let bytes: [u8; 32] = rng.random();
+            let pubkey = Pubkey::new_from_array(bytes);
+            out.push(BenchPubkey::from(pubkey));
+        }
+    }
+    out.shuffle(rng);
+    out
+}
+
+fn make_pubkeys_with_hotset(
+    rng: &mut StdRng,
+    count: usize,
+    hotset_size: usize,
+    hotset_pct: u8,
+) -> Vec<BenchPubkey> {
+    let hotset = make_pubkeys(rng, hotset_size.max(1));
+    make_pubkeys_with_hotset_from(rng, count, &hotset, hotset_pct)
+}
+
+fn random_key_count(rng: &mut StdRng) -> usize {
+    let roll = rng.random_range(0..100);
+    if roll < 50 {
+        rng.random_range(8..=12)
+    } else if roll < 80 {
+        rng.random_range(13..=20)
+    } else if roll < 95 {
+        rng.random_range(21..=32)
+    } else {
+        rng.random_range(33..=64)
+    }
+}
+
+fn random_program_id_count(rng: &mut StdRng, key_count: usize) -> usize {
+    let roll = rng.random_range(0..100);
+    let desired = if roll < 70 {
+        1
+    } else if roll < 95 {
+        2
+    } else {
+        3
+    };
+    desired.min(key_count.saturating_sub(1)).max(1)
+}
+
+fn random_ix_count(rng: &mut StdRng) -> usize {
+    let roll = rng.random_range(0..100);
+    if roll < 50 {
+        1
+    } else if roll < 80 {
+        2
+    } else if roll < 92 {
+        3
+    } else if roll < 98 {
+        4
+    } else {
+        rng.random_range(5..=8)
+    }
+}
+
+fn random_accounts_len(rng: &mut StdRng, max_accounts: usize) -> usize {
+    if max_accounts <= 1 {
+        return max_accounts;
+    }
+    let roll = rng.random_range(0..100);
+    let (min, max) = if roll < 55 {
+        (2, 4)
+    } else if roll < 85 {
+        (5, 8)
+    } else if roll < 95 {
+        (9, 12)
+    } else {
+        (13, 20)
+    };
+    let lo = min.min(max_accounts);
+    let hi = max.min(max_accounts);
+    if lo > hi {
+        max_accounts
+    } else {
+        rng.random_range(lo..=hi)
+    }
+}
+
+fn random_data_len(rng: &mut StdRng) -> usize {
+    let roll = rng.random_range(0..100);
+    if roll < 55 {
+        rng.random_range(0..=16)
+    } else if roll < 85 {
+        rng.random_range(17..=64)
+    } else if roll < 95 {
+        rng.random_range(65..=256)
+    } else {
+        rng.random_range(257..=1024)
+    }
+}
+
+fn make_instructions(
+    rng: &mut StdRng,
+    count: usize,
+    key_count: usize,
+    program_id_start: usize,
+) -> Vec<BenchCompiledInstruction> {
+    let non_program_count = program_id_start;
+    let max_accounts = non_program_count.max(1);
+    (0..count)
+        .map(|_| {
+            let accounts_len = random_accounts_len(rng, max_accounts);
+            let mut accounts = (0..non_program_count as u8).collect::<Vec<u8>>();
+            accounts.shuffle(rng);
+            accounts.truncate(accounts_len);
+            let data_len = random_data_len(rng);
+            let data = (0..data_len).map(|_| rng.random()).collect::<Vec<u8>>();
+            let ix = CompiledInstruction {
+                program_id_index: rng.random_range(program_id_start as u8..key_count as u8),
+                accounts,
+                data,
+            };
+            BenchCompiledInstruction::from(&ix)
+        })
+        .collect()
+}
+
+fn make_message(rng: &mut StdRng) -> BenchMessage {
+    let key_count = random_key_count(rng);
+    let program_id_count = random_program_id_count(rng, key_count);
+    let program_id_start = key_count - program_id_count;
+    let ix_count = random_ix_count(rng);
+    let account_keys = make_pubkeys(rng, key_count);
+    let recent_blockhash: [u8; 32] = rng.random();
+    let instructions = make_instructions(rng, ix_count, key_count, program_id_start);
+    BenchMessage {
+        account_keys,
+        recent_blockhash,
+        instructions,
+    }
+}
+
+fn bench_pubkey(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(0xA11CE);
+    let pubkey = make_pubkeys(&mut rng, 1)
+        .pop()
+        .expect("expected one pubkey");
+    bench_codec(c, "solana_pubkey", &pubkey);
+}
+
+fn bench_pubkey_vec_dupes(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(0xD00D);
+    let count = 128;
+    let hotset_size = 8;
+    let hotset_pct = 30;
+    let pubkeys = make_pubkeys_with_hotset(&mut rng, count, hotset_size, hotset_pct);
+    let capacity = count;
+    let label = format!("solana_pubkey_vec_hotset_{}pct", hotset_pct);
+
+    let mut group = c.comparison_benchmark_group(format!("{label}_encode"));
+    group.bench_function("lencode", |b| {
+        b.iter_batched(
+            lencode::io::VecWriter::new,
+            |mut writer| {
+                encode_lencode_into(&pubkeys, &mut writer);
+                black_box(writer.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("lencode_dedupe", |b| {
+        b.iter_batched(
+            || {
+                (
+                    lencode::io::VecWriter::new(),
+                    EncoderContext {
+                        dedupe: Some(DedupeEncoder::with_capacity(capacity, 1)),
+                        diff: None,
+                    },
+                )
+            },
+            |(mut writer, mut encoder)| {
+                encode_lencode_dedupe_into(&pubkeys, &mut encoder, &mut writer);
+                black_box(writer.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("bincode", |b| {
+        b.iter_batched(
+            || Cursor::new(Vec::new()),
+            |mut cursor| {
+                encode_bincode_into(&pubkeys, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("borsh", |b| {
+        b.iter_batched(
+            || Cursor::new(Vec::new()),
+            |mut cursor| {
+                encode_borsh_into(&pubkeys, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("wincode", |b| {
+        b.iter_batched(
+            || WincodeCursor::new(Vec::new()),
+            |mut cursor| {
+                encode_wincode_into(&pubkeys, &mut cursor);
+                black_box(cursor.into_inner());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+
+    let lencode_bytes = encode_lencode(&pubkeys);
+    let lencode_dedupe_bytes = {
+        let mut encoder = EncoderContext {
+            dedupe: Some(DedupeEncoder::with_capacity(capacity, 1)),
+            diff: None,
+        };
+        encode_lencode_dedupe(&pubkeys, &mut encoder)
+    };
+    let bincode_bytes = encode_bincode(&pubkeys);
+    let borsh_bytes = encode_borsh(&pubkeys);
+    let wincode_bytes = encode_wincode(&pubkeys);
+
+    let size_batch_count = 16usize;
+    let mut size_rng = StdRng::seed_from_u64(0xD00D_BEEF);
+    let size_hotset = make_pubkeys(&mut size_rng, hotset_size.max(1));
+    let mut size_lencode_total = 0usize;
+    let mut size_lencode_dedupe_total = 0usize;
+    let mut size_bincode_total = 0usize;
+    let mut size_borsh_total = 0usize;
+    let mut size_wincode_total = 0usize;
+    let mut size_encoder = EncoderContext {
+        dedupe: Some(DedupeEncoder::with_capacity(
+            capacity.saturating_mul(size_batch_count),
+            1,
+        )),
+        diff: None,
+    };
+    for _ in 0..size_batch_count {
+        let batch = make_pubkeys_with_hotset_from(&mut size_rng, count, &size_hotset, hotset_pct);
+        size_lencode_total += encode_lencode(&batch).len();
+        size_lencode_dedupe_total += encode_lencode_dedupe(&batch, &mut size_encoder).len();
+        size_bincode_total += encode_bincode(&batch).len();
+        size_borsh_total += encode_borsh(&batch).len();
+        size_wincode_total += encode_wincode(&batch).len();
+    }
+    let size_lencode = size_lencode_total / size_batch_count;
+    let size_lencode_dedupe = size_lencode_dedupe_total / size_batch_count;
+    let size_bincode = size_bincode_total / size_batch_count;
+    let size_borsh = size_borsh_total / size_batch_count;
+    let size_wincode = size_wincode_total / size_batch_count;
+
+    println!(
+        "[size] {label}: lencode={} lencode_dedupe={} bincode={} borsh={} wincode={}",
+        size_lencode, size_lencode_dedupe, size_bincode, size_borsh, size_wincode
+    );
+
+    let mut group = c.comparison_benchmark_group(format!("{label}_decode"));
+    group.bench_function("lencode", |b| {
+        b.iter(|| black_box(decode_lencode::<Vec<BenchPubkey>>(&lencode_bytes)))
+    });
+    group.bench_function("lencode_dedupe", |b| {
+        b.iter_batched(
+            || DecoderContext {
+                dedupe: Some(DedupeDecoder::with_capacity(capacity)),
+                diff: None,
+            },
+            |mut decoder| {
+                black_box(decode_lencode_dedupe::<Vec<BenchPubkey>>(
+                    &lencode_dedupe_bytes,
+                    &mut decoder,
+                ))
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("bincode", |b| {
+        b.iter(|| black_box(decode_bincode::<Vec<BenchPubkey>>(&bincode_bytes)))
+    });
+    group.bench_function("borsh", |b| {
+        b.iter(|| black_box(decode_borsh::<Vec<BenchPubkey>>(&borsh_bytes)))
+    });
+    group.bench_function("wincode", |b| {
+        b.iter(|| black_box(decode_wincode::<Vec<BenchPubkey>>(&wincode_bytes)))
+    });
+    group.finish();
+}
+
+fn bench_message(c: &mut Criterion) {
+    let mut rng = StdRng::seed_from_u64(0xBEEF);
+    let message = make_message(&mut rng);
+    bench_codec(c, "solana_message", &message);
+}
+
+criterion_group!(benches, bench_pubkey, bench_pubkey_vec_dupes, bench_message);
+criterion_main!(benches);

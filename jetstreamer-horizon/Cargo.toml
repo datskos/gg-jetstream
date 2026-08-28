@@ -43,11 +43,10 @@ solana-message.workspace = true
 solana-pubkey.workspace = true
 # verify_archive --full: canonical PoH recompute + seed fetch
 solana-entry.workspace = true
-# shred_compression example: wire-format baseline. bincode here is deliberate
-# and correct: it IS the turbine wire encoding in agave 3.x. Swap to wincode
-# (byte-identical, preferred) once the workspace reaches solana-transaction
-# >= 3.1, whose `wincode` feature is currently blocked by an agave =3.0.2 pin.
+# shred_compression still uses bincode for its local serde-only dump schema;
+# the native Agave v4 entry/transaction wire baseline uses wincode.
 bincode.workspace = true
+wincode.workspace = true
 solana-transaction.workspace = true
 serde = { workspace = true, features = ["derive"] }
 solana-signature.workspace = true

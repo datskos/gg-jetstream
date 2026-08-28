@@ -39,7 +39,7 @@ use jetstreamer_horizon::limits::{
 use jetstreamer_horizon::pubkey_prime::POPULAR_PUBKEYS;
 use jetstreamer_horizon::transactions::{
     CompiledInstruction, LegacyMessage, MessageAddressTableLookup, MessageHeader, Transaction,
-    V0Message, VersionedMessage,
+    V0Message, V1Message, VersionedMessage,
 };
 use lencode::io::Cursor;
 use lencode::prelude::*;
@@ -167,6 +167,13 @@ fn tx_complexity_score(tx: &VersionedTransaction) -> usize {
                     .map(|l| 32 + l.writable_indexes.len() + l.readonly_indexes.len())
                     .sum::<usize>()
         }
+        UpVm::V1(m) => {
+            sigs + m.account_keys.len() * 32
+                + m.instructions
+                    .iter()
+                    .map(|ix| 1 + ix.accounts.len() + ix.data.len())
+                    .sum::<usize>()
+        }
     }
 }
 
@@ -225,6 +232,13 @@ fn fits_our_bounds(tx: &VersionedTransaction) -> bool {
             m.account_keys.len() <= MAX_TX_ACCOUNTS
                 && m.instructions.len() <= MAX_TX_INSTRUCTIONS
                 && m.address_table_lookups.len() <= MAX_TX_ADDR_LOOKUPS
+                && m.instructions.iter().all(|ix| {
+                    ix.accounts.len() <= MAX_IX_ACCOUNTS && ix.data.len() <= MAX_IX_DATA_LEN
+                })
+        }
+        UpVm::V1(m) => {
+            m.account_keys.len() <= MAX_TX_ACCOUNTS
+                && m.instructions.len() <= MAX_TX_INSTRUCTIONS
                 && m.instructions.iter().all(|ix| {
                     ix.accounts.len() <= MAX_IX_ACCOUNTS && ix.data.len() <= MAX_IX_DATA_LEN
                 })
@@ -358,6 +372,28 @@ fn copy_v0(dst: &mut V0Message, src: &solana_message::v0::Message) {
     }
 }
 
+fn copy_v1(dst: &mut V1Message, src: &solana_message::v1::Message) {
+    dst.header = MessageHeader {
+        num_required_signatures: src.header.num_required_signatures,
+        num_readonly_signed_accounts: src.header.num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts: src.header.num_readonly_unsigned_accounts,
+    };
+    dst.config.priority_fee = src.config.priority_fee;
+    dst.config.compute_unit_limit = src.config.compute_unit_limit;
+    dst.config.loaded_accounts_data_size_limit = src.config.loaded_accounts_data_size_limit;
+    dst.config.heap_size = src.config.heap_size;
+    dst.lifetime_specifier = src.lifetime_specifier;
+    for pk in &src.account_keys {
+        dst.account_keys
+            .push(Address::new_from_array(pk.to_bytes()));
+    }
+    for ix in &src.instructions {
+        let mut ours = CompiledInstruction::default();
+        copy_instruction(&mut ours, ix);
+        dst.instructions.push(ours);
+    }
+}
+
 /// Copies a real `VersionedTransaction`'s signatures + message into `tx`
 /// in-place (no 750 KiB stack temporary).
 fn populate_from_real(tx: &mut Transaction, real: &VersionedTransaction) {
@@ -399,6 +435,10 @@ fn populate_from_real(tx: &mut Transaction, real: &VersionedTransaction) {
                 }
                 _ => unreachable!(),
             }
+        }
+        UpVm::V1(m) => {
+            let dst = tx.message.force_v1_mut();
+            copy_v1(dst, m);
         }
     }
 }
@@ -1310,16 +1350,11 @@ fn write_simulated_archive(
             populate_from_real(&mut scratch, real);
 
             // Attach realistic account updates.
-            let is_vote = match &real.message {
-                solana_message::VersionedMessage::Legacy(m) => m
-                    .account_keys
-                    .iter()
-                    .any(|k| Address::new_from_array(k.to_bytes()) == vote_program),
-                solana_message::VersionedMessage::V0(m) => m
-                    .account_keys
-                    .iter()
-                    .any(|k| Address::new_from_array(k.to_bytes()) == vote_program),
-            };
+            let is_vote = real
+                .message
+                .static_account_keys()
+                .iter()
+                .any(|k| Address::new_from_array(k.to_bytes()) == vote_program);
             if is_vote {
                 let validator = (rng.next_u64() as usize) % 1_500;
                 let (pk, data) = ledger.touch_vote(validator);

@@ -140,6 +140,7 @@ impl SlotVisitor for Collector {
         let keys = match &tx.message {
             VersionedMessage::Legacy(m) => m.account_keys.as_slice(),
             VersionedMessage::V0(m) => m.account_keys.as_slice(),
+            VersionedMessage::V1(m) => m.account_keys.as_slice(),
         };
         for k in keys {
             self.note(*k);

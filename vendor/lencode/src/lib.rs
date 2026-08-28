@@ -1,0 +1,2289 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+//! Compact, fast binary encoding with varints and optional deduplication.
+//!
+//! This crate provides two core traits, [`Encode`] and [`Decode`], for serializing types to a
+//! [`Write`] and deserializing from a [`Read`] without relying on `std`. Integer types use a
+//! compact variable‑length scheme (see [`Lencode`]) that encodes small values in a single byte
+//! while remaining efficient for large values.
+//!
+//! Optional deduplication can be enabled per encode/decode call via
+//! [`DedupeEncoder`]/[`DedupeDecoder`], which replaces repeated values with small IDs to
+//! reduce size for data with many duplicates.
+//!
+//! Derive macros for [`Encode`], [`Decode`], and [`Pack`] are available from the companion
+//! crate [`lencode_macros`] and re‑exported in [`prelude`]. `#[derive(Pack)]` on a
+//! `#[repr(transparent)]` single‑field struct automatically generates bulk `pack_slice`
+//! and `unpack_vec` overrides for zero‑copy I/O.
+//!
+//! Bytes and strings are compacted using a flagged header with opportunistic zstd compression:
+//!
+//! - Formats: `&[u8]`, `Vec<u8>`, `VecDeque<u8>`, `&str`, `String`
+//! - Wire: `varint((payload_len << 1) | flag) + payload`
+//!   - `flag = 1` → `payload` is a zstd frame (original size is stored in the frame)
+//!   - `flag = 0` → `payload` is raw bytes/UTF‑8
+//! - The encoder picks whichever is smaller per value.
+//! - High‑entropy data (random bytes) is detected via a fast entropy check and skips
+//!   compression entirely, avoiding wasted work.
+//!
+//! This keeps headers minimal while improving size significantly for repetitive content, and
+//! is `no_std` compatible via `zstd-safe`.
+//!
+//! ## Incremental diff encoding
+//!
+//! [`DiffEncoder`]/[`DiffDecoder`] provide stateful delta encoding for keyed byte blobs.
+//! When a blob is re-encoded under the same key, only the diff is emitted. Two strategies
+//! are tried and the smaller output is picked automatically:
+//!
+//! - **RLE patches** (mode 1): run-length-encoded list of changed regions
+//! - **XOR + zstd** (mode 2): XOR old and new blobs, then zstd-compress the result
+//!
+//! Supported byte types: `Vec<u8>`, `&[u8]`, `[u8; N]`, `VecDeque<u8>`. Enable via
+//! [`EncoderContext::with_diff`] / [`DecoderContext::with_diff`] and call `set_key()`
+//! before each encode/decode to opt in for a given field.
+//!
+//! Both [`DedupeEncoder`] and [`DiffEncoder`]/[`DiffDecoder`] provide introspection
+//! methods (`len()`, `num_keys()`, `memory_usage()`, etc.) and granular state management
+//! (`clear()`, `clear_type::<T>()`, `remove_key()`).
+//!
+//! ## Bulk encoding
+//!
+//! Collections of fixed‑size elements (e.g. `Vec<[u8; 32]>`) are encoded via bulk
+//! `memcpy` when possible, avoiding per‑element overhead. This is handled automatically
+//! through [`Encode::encode_slice`] and [`Decode::decode_vec`], which types can override
+//! for optimized batch operations. The [`Pack`] trait provides analogous
+//! [`Pack::pack_slice`]/[`Pack::unpack_vec`] methods for deduplicated types.
+//!
+//! Quick start:
+//!
+//! ```rust
+//! use lencode::prelude::*;
+//!
+//! #[derive(Encode, Decode, PartialEq, Debug)]
+//! struct Point { x: u64, y: u64 }
+//!
+//! let p = Point { x: 3, y: 5 };
+//! let mut buf = Vec::new();
+//! let _n = encode(&p, &mut buf).unwrap();
+//! let q: Point = decode(&mut Cursor::new(&buf)).unwrap();
+//! assert_eq!(p, q);
+//! ```
+//!
+//! Collections and primitives:
+//!
+//! ```rust
+//! use lencode::prelude::*;
+//!
+//! let values: Vec<u128> = (0..10).collect();
+//! let mut buf = Vec::new();
+//! encode(&values, &mut buf).unwrap();
+//! let roundtrip: Vec<u128> = decode(&mut Cursor::new(&buf)).unwrap();
+//! assert_eq!(values, roundtrip);
+//! ```
+//!
+//! Deduplication (smaller output for repeated values):
+//!
+//! ```rust
+//! use lencode::prelude::*;
+//!
+//! // A small type we want to dedupe; implements Pack and the dedupe markers.
+//! // Note that this is a toy example, in practice `MyId` would be more
+//! // efficiently encoded using regular lencode encoding because it wraps a u32.
+//! #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+//! struct MyId(u32);
+//!
+//! impl Pack for MyId {
+//!     fn pack(&self, w: &mut impl Write) -> Result<usize> { self.0.pack(w) }
+//!     fn unpack(r: &mut impl Read) -> Result<Self> { Ok(Self(u32::unpack(r)?)) }
+//! }
+//! impl DedupeEncodeable for MyId {
+//!     type Hasher = DefaultDedupeHasher;
+//! }
+//! impl DedupeDecodeable for MyId {
+//!     type Hasher = DefaultDedupeHasher;
+//! }
+//!
+//! // Prepare some data with many repeats
+//! let vals = vec![MyId(42), MyId(7), MyId(42), MyId(7), MyId(42), MyId(7), MyId(42)];
+//!
+//! // Encode without deduplication
+//! let mut plain = Vec::new();
+//! encode(&vals, &mut plain).unwrap();
+//!
+//! // Encode with deduplication enabled
+//! let mut ctx = EncoderContext::with_dedupe();
+//! let mut deduped = Vec::new();
+//! encode_ext(&vals, &mut deduped, Some(&mut ctx)).unwrap();
+//! assert!(deduped.len() < plain.len());
+//!
+//! // Round-trip decoding with a DecoderContext
+//! let mut ctx_dec = DecoderContext::with_dedupe();
+//! let rt: Vec<MyId> = decode_ext(&mut Cursor::new(&deduped), Some(&mut ctx_dec)).unwrap();
+//! assert_eq!(rt, vals);
+//! ```
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::collections;
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use std::collections;
+
+mod bytes;
+pub mod context;
+pub mod dedupe;
+pub mod diff;
+pub mod io;
+pub mod pack;
+pub mod tuples;
+pub mod u256;
+pub mod varint;
+
+#[cfg(feature = "solana")]
+pub mod solana;
+
+/// Convenience re‑exports for common traits, modules and derive macros.
+pub mod prelude {
+    pub use super::*;
+    pub use crate::context::*;
+    pub use crate::dedupe::*;
+    pub use crate::diff::*;
+    pub use crate::io::*;
+    pub use crate::pack::*;
+    pub use crate::u256::*;
+    pub use crate::varint::*;
+    pub use lencode_macros::*;
+}
+
+use core::mem::MaybeUninit;
+use core::num::{
+    NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI128, NonZeroIsize, NonZeroU8,
+    NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize,
+};
+use core::ptr;
+
+use prelude::*;
+
+/// Encodes `value` into `writer` using the type’s [`Encode`] implementation.
+///
+/// Returns the number of bytes written on success.
+#[inline(always)]
+pub fn encode<T: Encode>(value: &T, writer: &mut impl Write) -> Result<usize> {
+    value.encode_ext(writer, None)
+}
+
+/// Decodes a value of type `T` from `reader` using `T`’s [`Decode`] implementation.
+#[inline(always)]
+pub fn decode<T: Decode>(reader: &mut impl Read) -> Result<T> {
+    T::decode_ext(reader, None)
+}
+
+/// Encodes `value` with an optional [`EncoderContext`] for deduplication and/or
+/// diff encoding.
+#[inline(always)]
+pub fn encode_ext(
+    value: &impl Encode,
+    writer: &mut impl Write,
+    ctx: Option<&mut EncoderContext>,
+) -> Result<usize> {
+    value.encode_ext(writer, ctx)
+}
+
+/// Decodes a value with an optional [`DecoderContext`] for deduplication and/or
+/// diff decoding.
+#[inline(always)]
+pub fn decode_ext<T: Decode>(
+    reader: &mut impl Read,
+    ctx: Option<&mut DecoderContext>,
+) -> Result<T> {
+    T::decode_ext(reader, ctx)
+}
+
+// Provide a Result alias that defaults to this crate's [`Error`] type while still allowing
+// callers (and macros) to specify a different error type when needed. This avoids clashing
+// with macros that expect the standard `Result` alias to accept two generic parameters.
+/// Crate‑wide `Result` that defaults to [`Error`].
+///
+/// The second parameter remains customizable for macros that expect a two‑parameter `Result`
+/// alias.
+pub type Result<T, E = Error> = core::result::Result<T, E>;
+
+/// Trait for types that can be encoded to a binary stream.
+///
+/// Implementors must provide [`Encode::encode_ext`]. The remaining methods have
+/// sensible defaults but can be overridden for performance (e.g. bulk `memcpy`
+/// for fixed‑size types).
+pub trait Encode {
+    /// Encodes `self` to `writer`, optionally using an [`EncoderContext`].
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize>;
+
+    /// Encodes a collection length in a compact form.
+    #[inline(always)]
+    fn encode_len(len: usize, writer: &mut impl Write) -> Result<usize> {
+        Lencode::encode_varint_u64(len as u64, writer)
+    }
+
+    /// Encodes an enum discriminant in a compact, consistent form.
+    ///
+    /// The default uses an unsigned varint.
+    #[inline(always)]
+    fn encode_discriminant(discriminant: usize, writer: &mut impl Write) -> Result<usize> {
+        Lencode::encode_varint_u64(discriminant as u64, writer)
+    }
+
+    /// Convenience wrapper around [`Encode::encode_ext`] without deduplication.
+    #[inline(always)]
+    fn encode(&self, writer: &mut impl Write) -> Result<usize> {
+        self.encode_ext(writer, None)
+    }
+
+    /// Encodes a contiguous slice of items without deduplication.
+    ///
+    /// The default iterates per‑element. Types whose wire representation is a
+    /// fixed‑size byte sequence (e.g. `[u8; N]`) override this to perform a
+    /// single bulk write, which is significantly faster for large collections.
+    ///
+    /// Called automatically by `Vec<T>::encode_ext` when no dedupe context is
+    /// active.
+    #[inline(always)]
+    fn encode_slice(items: &[Self], writer: &mut impl Write) -> Result<usize>
+    where
+        Self: Sized,
+    {
+        let mut total = 0;
+        for item in items {
+            total += item.encode_ext(writer, None)?;
+        }
+        Ok(total)
+    }
+}
+
+/// Trait for types that can be decoded from a binary stream.
+///
+/// Implementors must provide [`Decode::decode_ext`]. The remaining methods have
+/// sensible defaults but can be overridden for performance (e.g. bulk `memcpy`
+/// for fixed‑size types).
+pub trait Decode {
+    /// Decodes `Self` from `reader`, optionally using a [`DecoderContext`].
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Decodes a collection length previously encoded with [`Encode::encode_len`].
+    #[inline(always)]
+    fn decode_len(reader: &mut impl Read) -> Result<usize> {
+        Lencode::decode_varint_u64(reader).map(|v| v as usize)
+    }
+
+    /// Decodes an enum discriminant previously encoded with [`Encode::encode_discriminant`].
+    ///
+    /// The default reads an unsigned varint.
+    #[inline(always)]
+    fn decode_discriminant(reader: &mut impl Read) -> Result<usize> {
+        Lencode::decode_varint_u64(reader).map(|v| v as usize)
+    }
+
+    /// Convenience wrapper around [`Decode::decode_ext`] without deduplication.
+    #[inline(always)]
+    fn decode(reader: &mut impl Read) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::decode_ext(reader, None)
+    }
+
+    /// Decodes `count` items into a `Vec` without deduplication.
+    ///
+    /// The default iterates per‑element. Types whose wire representation is a
+    /// fixed‑size byte sequence (e.g. `[u8; N]`) override this to perform a
+    /// single bulk read, which is significantly faster for large collections.
+    ///
+    /// Called automatically by `Vec<T>::decode_ext` when no dedupe context is
+    /// active.
+    #[inline(always)]
+    fn decode_vec(reader: &mut impl Read, count: usize) -> Result<Vec<Self>>
+    where
+        Self: Sized,
+    {
+        let mut vec = Vec::with_capacity(count);
+        for _ in 0..count {
+            vec.push(Self::decode_ext(reader, None)?);
+        }
+        Ok(vec)
+    }
+}
+
+macro_rules! impl_encode_decode_unsigned_primitive {
+    ($($t:ty),*) => {
+        $(
+            impl Encode for $t {
+                #[inline(always)]
+                fn encode_ext(&self, writer: &mut impl Write, _ctx: Option<&mut EncoderContext>) -> Result<usize> {
+                    Lencode::encode_varint(*self, writer)
+                }
+            }
+
+            impl Decode for $t {
+                #[inline(always)]
+                fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+                    Lencode::decode_varint(reader)
+                }
+
+                #[inline(always)]
+                fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+                    unimplemented!()
+                }
+            }
+        )*
+    };
+}
+
+impl_encode_decode_unsigned_primitive!(U256);
+
+impl Encode for u16 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_u16(*self, writer)
+    }
+}
+
+impl Decode for u16 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_varint_u16(reader)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for u32 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_u32(*self, writer)
+    }
+}
+
+impl Decode for u32 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_varint_u32(reader)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for u64 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_u64(*self, writer)
+    }
+}
+
+impl Decode for u64 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_varint_u64(reader)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for u128 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_u128(*self, writer)
+    }
+}
+
+impl Decode for u128 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_varint_u128(reader)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for usize {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_u64(*self as u64, writer)
+    }
+}
+
+impl Decode for usize {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_varint_u64(reader).map(|v| v as usize)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+macro_rules! impl_encode_decode_signed_primitive {
+    ($($t:ty),*) => {
+        $(
+            impl Encode for $t {
+                #[inline(always)]
+                fn encode_ext(&self, writer: &mut impl Write, _ctx: Option<&mut EncoderContext>) -> Result<usize> {
+                    Lencode::encode_varint_signed(*self, writer)
+                }
+            }
+
+            impl Decode for $t {
+                #[inline(always)]
+                fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+                    Lencode::decode_varint_signed(reader)
+                }
+
+                #[inline(always)]
+                fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+                    unimplemented!()
+                }
+            }
+        )*
+    };
+}
+
+impl_encode_decode_signed_primitive!();
+
+impl Encode for i16 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_i16(*self, writer)
+    }
+}
+
+impl Decode for i16 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(zigzag_decode(Lencode::decode_varint_u16(reader)?))
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for i32 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_i32(*self, writer)
+    }
+}
+
+impl Decode for i32 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(zigzag_decode(Lencode::decode_varint_u32(reader)?))
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for i64 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_i64(*self, writer)
+    }
+}
+
+impl Decode for i64 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(zigzag_decode(Lencode::decode_varint_u64(reader)?))
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for i128 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_i128(*self, writer)
+    }
+}
+
+impl Decode for i128 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(zigzag_decode(Lencode::decode_varint_u128(reader)?))
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for isize {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_varint_i64(*self as i64, writer)
+    }
+}
+
+impl Decode for isize {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(zigzag_decode(Lencode::decode_varint_u64(reader)?) as isize)
+    }
+
+    #[inline(always)]
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+macro_rules! impl_encode_decode_nonzero {
+    ($(($nonzero:ty, $inner:ty)),* $(,)?) => {
+        $(
+            impl Encode for $nonzero {
+                #[inline(always)]
+                fn encode_ext(
+                    &self,
+                    writer: &mut impl Write,
+                    ctx: Option<&mut EncoderContext>,
+                ) -> Result<usize> {
+                    let value: $inner = self.get();
+                    value.encode_ext(writer, ctx)
+                }
+            }
+
+            impl Decode for $nonzero {
+                #[inline(always)]
+                fn decode_ext(
+                    reader: &mut impl Read,
+                    ctx: Option<&mut DecoderContext>,
+                ) -> Result<Self> {
+                    let value: $inner = <$inner as Decode>::decode_ext(reader, ctx)?;
+                    Self::new(value).ok_or(Error::InvalidData)
+                }
+
+                #[inline(always)]
+                fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+                    unimplemented!()
+                }
+            }
+        )*
+    };
+}
+
+impl_encode_decode_nonzero!(
+    (NonZeroU8, u8),
+    (NonZeroU16, u16),
+    (NonZeroU32, u32),
+    (NonZeroU64, u64),
+    (NonZeroU128, u128),
+    (NonZeroUsize, usize),
+    (NonZeroI8, i8),
+    (NonZeroI16, i16),
+    (NonZeroI32, i32),
+    (NonZeroI64, i64),
+    (NonZeroI128, i128),
+    (NonZeroIsize, isize),
+);
+
+impl Encode for bool {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Lencode::encode_bool(*self, writer)
+    }
+}
+
+impl Decode for bool {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Lencode::decode_bool(reader)
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+// Floating point support for convenience in client types (e.g., UiTokenAmount)
+impl Encode for f32 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        if let Some(dst) = writer.buf_mut() {
+            if dst.len() < 4 {
+                return Err(Error::WriterOutOfSpace);
+            }
+            unsafe {
+                (dst.as_mut_ptr() as *mut [u8; 4]).write_unaligned(self.to_le_bytes());
+            }
+            writer.advance_mut(4);
+            return Ok(4);
+        }
+        let bytes = self.to_le_bytes();
+        writer.write(&bytes)
+    }
+}
+
+impl Decode for f32 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        if let Some(slice) = reader.buf() {
+            if slice.len() < 4 {
+                return Err(Error::ReaderOutOfData);
+            }
+            let val = unsafe { (slice.as_ptr() as *const [u8; 4]).read_unaligned() };
+            reader.advance(4);
+            return Ok(f32::from_le_bytes(val));
+        }
+        let mut buf = [0u8; 4];
+        if reader.read(&mut buf)? != 4 {
+            return Err(Error::ReaderOutOfData);
+        }
+        Ok(f32::from_le_bytes(buf))
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for f64 {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        if let Some(dst) = writer.buf_mut() {
+            if dst.len() < 8 {
+                return Err(Error::WriterOutOfSpace);
+            }
+            unsafe {
+                (dst.as_mut_ptr() as *mut [u8; 8]).write_unaligned(self.to_le_bytes());
+            }
+            writer.advance_mut(8);
+            return Ok(8);
+        }
+        let bytes = self.to_le_bytes();
+        writer.write(&bytes)
+    }
+}
+
+impl Decode for f64 {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        if let Some(slice) = reader.buf() {
+            if slice.len() < 8 {
+                return Err(Error::ReaderOutOfData);
+            }
+            let val = unsafe { (slice.as_ptr() as *const [u8; 8]).read_unaligned() };
+            reader.advance(8);
+            return Ok(f64::from_le_bytes(val));
+        }
+        let mut buf = [0u8; 8];
+        if reader.read(&mut buf)? != 8 {
+            return Err(Error::ReaderOutOfData);
+        }
+        Ok(f64::from_le_bytes(buf))
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for &[u8] {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        // Diff encoding path: when a diff encoder with an active key is present
+        if let Some(ref mut c) = ctx
+            && let Some(ref mut diff) = c.diff
+            && diff.current_key.is_some()
+        {
+            return diff.encode_blob(self, writer);
+        }
+
+        // Encode as either raw or compressed with a 1-bit flag in the header:
+        // header = varint((payload_len << 1) | (is_compressed as usize))
+        let raw_len = self.len();
+        // Skip compression for small payloads where overhead outweighs savings
+        if raw_len >= bytes::MIN_COMPRESS_LEN
+            && !bytes::looks_incompressible(self)
+            && let Some(n) = bytes::compress_and_write(self, writer)?
+        {
+            return Ok(n);
+        }
+        bytes::write_flagged_raw(writer, self, 0)
+    }
+}
+
+impl Encode for &str {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        // Encode as either raw UTF-8 bytes or compressed with a 1-bit flag in header
+        let bytes = self.as_bytes();
+        let raw_len = bytes.len();
+        // Skip compression for small payloads where overhead outweighs savings
+        if raw_len >= bytes::MIN_COMPRESS_LEN
+            && !bytes::looks_incompressible(bytes)
+            && let Some(n) = bytes::compress_and_write(bytes, writer)?
+        {
+            return Ok(n);
+        }
+        bytes::write_flagged_raw(writer, bytes, 0)
+    }
+}
+
+impl Encode for String {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.as_str().encode_ext(writer, None)
+    }
+}
+
+impl Decode for String {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let flagged = Self::decode_len(reader)?;
+        let is_compressed = (flagged & 1) == 1;
+        let payload_len = flagged >> 1;
+        if is_compressed {
+            // Zero-copy fast path
+            if let Some(slice) = reader.buf()
+                && slice.len() >= payload_len
+            {
+                let comp = &slice[..payload_len];
+                let orig_len = bytes::zstd_content_size(comp)?;
+                let out = bytes::zstd_decompress(comp, orig_len)?;
+                reader.advance(payload_len);
+                return String::from_utf8(out).map_err(|_| Error::InvalidData);
+            }
+            let mut comp = vec![0u8; payload_len];
+            let mut read = 0usize;
+            while read < payload_len {
+                read += reader.read(&mut comp[read..])?;
+            }
+            let orig_len = bytes::zstd_content_size(&comp)?;
+            let out = bytes::zstd_decompress(&comp, orig_len)?;
+            String::from_utf8(out).map_err(|_| Error::InvalidData)
+        } else {
+            // Zero-copy fast path
+            if let Some(slice) = reader.buf()
+                && slice.len() >= payload_len
+            {
+                let mut buf = vec![0u8; payload_len];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(slice.as_ptr(), buf.as_mut_ptr(), payload_len);
+                }
+                reader.advance(payload_len);
+                return String::from_utf8(buf).map_err(|_| Error::InvalidData);
+            }
+            let mut buf = vec![0u8; payload_len];
+            let mut read = 0usize;
+            while read < payload_len {
+                read += reader.read(&mut buf[read..])?;
+            }
+            String::from_utf8(buf).map_err(|_| Error::InvalidData)
+        }
+    }
+}
+
+impl<T: Encode> Encode for Option<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        match self {
+            Some(value) => {
+                let mut total_written = 0;
+                total_written += Lencode::encode_bool(true, writer)?;
+                total_written += value.encode_ext(writer, ctx)?;
+                Ok(total_written)
+            }
+            None => Lencode::encode_bool(false, writer),
+        }
+    }
+}
+
+impl<T: Decode> Decode for Option<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        if Lencode::decode_bool(reader)? {
+            Ok(Some(T::decode_ext(reader, ctx)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode, E: Encode> Encode for core::result::Result<T, E> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        match self {
+            Ok(value) => {
+                let mut total_written = 0;
+                total_written += Lencode::encode_bool(true, writer)?;
+                total_written += value.encode_ext(writer, ctx)?;
+                Ok(total_written)
+            }
+            Err(err) => {
+                let mut total_written = 0;
+                total_written += Lencode::encode_bool(false, writer)?;
+                total_written += err.encode_ext(writer, ctx)?;
+                Ok(total_written)
+            }
+        }
+    }
+}
+
+impl<T: Decode, E: Decode> Decode for core::result::Result<T, E> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        if Lencode::decode_bool(reader)? {
+            Ok(Ok(T::decode_ext(reader, ctx)?))
+        } else {
+            Ok(Err(E::decode_ext(reader, ctx)?))
+        }
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<const N: usize, T: Encode + 'static> Encode for [T; N] {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        // Fast path: bulk copy for u8 arrays
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            let bytes: &[u8] =
+                unsafe { core::slice::from_raw_parts(self.as_ptr() as *const u8, N) };
+
+            // Diff encoding path
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                return diff.encode_blob(bytes, writer);
+            }
+
+            if let Some(buf) = writer.buf_mut()
+                && buf.len() >= N
+            {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), N);
+                }
+                writer.advance_mut(N);
+                return Ok(N);
+            }
+            return writer.write(bytes);
+        }
+        let mut total_written = 0;
+        for item in self {
+            total_written += item.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+
+    #[inline(always)]
+    fn encode_slice(items: &[Self], writer: &mut impl Write) -> Result<usize> {
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            let total = N * items.len();
+            let bytes: &[u8] =
+                unsafe { core::slice::from_raw_parts(items.as_ptr() as *const u8, total) };
+            return writer.write(bytes);
+        }
+        let mut total = 0;
+        for item in items {
+            total += item.encode_ext(writer, None)?;
+        }
+        Ok(total)
+    }
+}
+
+impl<const N: usize, T: Decode + 'static> Decode for [T; N] {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        // Fast path: bulk copy for u8 arrays
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            // Diff decoding path
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                let out = diff.decode_blob(reader)?;
+                if out.len() != N {
+                    return Err(Error::IncorrectLength);
+                }
+                let mut arr = MaybeUninit::<[T; N]>::uninit();
+                unsafe {
+                    core::ptr::copy_nonoverlapping(out.as_ptr(), arr.as_mut_ptr() as *mut u8, N);
+                }
+                return Ok(unsafe { arr.assume_init() });
+            }
+
+            let mut arr = MaybeUninit::<[T; N]>::uninit();
+            if let Some(buf) = reader.buf() {
+                if buf.len() >= N {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            arr.as_mut_ptr() as *mut u8,
+                            N,
+                        );
+                    }
+                    reader.advance(N);
+                    return Ok(unsafe { arr.assume_init() });
+                }
+                return Err(Error::ReaderOutOfData);
+            }
+            // Fallback: read through the trait
+            let dst = unsafe { core::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u8, N) };
+            let mut read = 0;
+            while read < N {
+                read += reader.read(&mut dst[read..])?;
+            }
+            return Ok(unsafe { arr.assume_init() });
+        }
+
+        let mut arr = MaybeUninit::<[T; N]>::uninit();
+        let arr_ptr = arr.as_mut_ptr() as *mut T;
+        let mut idx = 0;
+        while idx < N {
+            match T::decode_ext(reader, ctx.as_deref_mut()) {
+                Ok(value) => unsafe {
+                    ptr::write(arr_ptr.add(idx), value);
+                    idx += 1;
+                },
+                Err(err) => {
+                    for initialized in 0..idx {
+                        unsafe {
+                            ptr::drop_in_place(arr_ptr.add(initialized));
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        // SAFETY: every element was written above, so the array is fully initialized.
+        Ok(unsafe { arr.assume_init() })
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+
+    #[inline(always)]
+    fn decode_vec(reader: &mut impl Read, count: usize) -> Result<Vec<Self>> {
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            let total = N * count;
+            if let Some(buf) = reader.buf() {
+                if buf.len() >= total {
+                    let mut vec: Vec<Self> = Vec::with_capacity(count);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            vec.as_mut_ptr() as *mut u8,
+                            total,
+                        );
+                        vec.set_len(count);
+                    }
+                    reader.advance(total);
+                    return Ok(vec);
+                }
+                return Err(Error::ReaderOutOfData);
+            }
+            // Fallback: read through trait
+            let mut vec: Vec<Self> = Vec::with_capacity(count);
+            let dst =
+                unsafe { core::slice::from_raw_parts_mut(vec.as_mut_ptr() as *mut u8, total) };
+            let mut read = 0;
+            while read < total {
+                read += reader.read(&mut dst[read..])?;
+            }
+            unsafe { vec.set_len(count) };
+            return Ok(vec);
+        }
+        let mut vec = Vec::with_capacity(count);
+        for _ in 0..count {
+            vec.push(Self::decode_ext(reader, None)?);
+        }
+        Ok(vec)
+    }
+}
+
+impl<T: Decode + 'static> Decode for Vec<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        // If T is u8, decode flagged header + payload without a leading element count.
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            // Diff decoding path: when a diff decoder with an active key is present
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                let out = diff.decode_blob(reader)?;
+                let vec_t: Vec<T> = unsafe { core::mem::transmute::<Vec<u8>, Vec<T>>(out) };
+                return Ok(vec_t);
+            }
+
+            let flagged = Self::decode_len(reader)?;
+            let is_compressed = (flagged & 1) == 1;
+            let payload_len = flagged >> 1;
+            if is_compressed {
+                // Zero-copy fast path for compressed data
+                if let Some(slice) = reader.buf()
+                    && slice.len() >= payload_len
+                {
+                    let comp = &slice[..payload_len];
+                    let orig_len = bytes::zstd_content_size(comp)?;
+                    let out = bytes::zstd_decompress(comp, orig_len)?;
+                    reader.advance(payload_len);
+                    let vec_t: Vec<T> = unsafe { core::mem::transmute::<Vec<u8>, Vec<T>>(out) };
+                    return Ok(vec_t);
+                }
+                let mut comp = vec![0u8; payload_len];
+                let mut read = 0usize;
+                while read < payload_len {
+                    read += reader.read(&mut comp[read..])?;
+                }
+                let orig_len = bytes::zstd_content_size(&comp)?;
+                let out = bytes::zstd_decompress(&comp, orig_len)?;
+                let vec_t: Vec<T> = unsafe { core::mem::transmute::<Vec<u8>, Vec<T>>(out) };
+                return Ok(vec_t);
+            } else {
+                // Zero-copy fast path for raw data
+                if let Some(slice) = reader.buf()
+                    && slice.len() >= payload_len
+                {
+                    let mut out = Vec::<u8>::with_capacity(payload_len);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            slice.as_ptr(),
+                            out.as_mut_ptr(),
+                            payload_len,
+                        );
+                        out.set_len(payload_len);
+                    }
+                    reader.advance(payload_len);
+                    let vec_t: Vec<T> = unsafe { core::mem::transmute::<Vec<u8>, Vec<T>>(out) };
+                    return Ok(vec_t);
+                }
+                let mut out = vec![0u8; payload_len];
+                let mut read = 0usize;
+                while read < payload_len {
+                    read += reader.read(&mut out[read..])?;
+                }
+                let vec_t: Vec<T> = unsafe { core::mem::transmute::<Vec<u8>, Vec<T>>(out) };
+                return Ok(vec_t);
+            }
+        }
+
+        let len = Self::decode_len(reader)?;
+        if ctx.is_none() {
+            return T::decode_vec(reader, len);
+        }
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(T::decode_ext(reader, ctx.as_deref_mut())?);
+        }
+        Ok(vec)
+    }
+}
+
+impl<T: Encode + 'static> Encode for Vec<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        // If element type is u8, write as raw-or-compressed with flagged header, no element count:
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            // SAFETY: when T == u8, we can view the slice as &[u8]
+            let bytes: &[u8] =
+                unsafe { core::slice::from_raw_parts(self.as_ptr() as *const u8, self.len()) };
+
+            // Diff encoding path: when a diff encoder with an active key is present
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                return diff.encode_blob(bytes, writer);
+            }
+
+            let raw_len = bytes.len();
+            // Skip compression for small payloads where overhead outweighs savings
+            if raw_len >= bytes::MIN_COMPRESS_LEN
+                && !bytes::looks_incompressible(bytes)
+                && let Some(n) = bytes::compress_and_write(bytes, writer)?
+            {
+                return Ok(n);
+            }
+            return bytes::write_flagged_raw(writer, bytes, 0);
+        }
+
+        let mut total_written = 0;
+        if ctx.is_none() {
+            // Pre-reserve to avoid intermediate reallocations: header + payload
+            writer.reserve(self.len() * core::mem::size_of::<T>() + 9);
+            total_written += Self::encode_len(self.len(), writer)?;
+            total_written += T::encode_slice(self, writer)?;
+            return Ok(total_written);
+        }
+        total_written += Self::encode_len(self.len(), writer)?;
+        for item in self {
+            total_written += item.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+impl<K: Encode, V: Encode> Encode for collections::BTreeMap<K, V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for (key, value) in self {
+            total_written += key.encode_ext(writer, ctx.as_deref_mut())?;
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+impl<K: Decode + Ord, V: Decode> Decode for collections::BTreeMap<K, V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut map = collections::BTreeMap::new();
+        for _ in 0..len {
+            let key = K::decode_ext(reader, ctx.as_deref_mut())?;
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+}
+
+impl<V: Encode> Encode for collections::BTreeSet<V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for value in self {
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+impl<V: Decode + Ord> Decode for collections::BTreeSet<V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut set = collections::BTreeSet::new();
+        for _ in 0..len {
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            set.insert(value);
+        }
+        Ok(set)
+    }
+}
+
+impl<V: Encode + 'static> Encode for collections::VecDeque<V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        if core::any::TypeId::of::<V>() == core::any::TypeId::of::<u8>() {
+            // Flatten to contiguous bytes first
+            let (a, b) = self.as_slices();
+            let a_u8: &[u8] =
+                unsafe { core::slice::from_raw_parts(a.as_ptr() as *const u8, a.len()) };
+            let b_u8: &[u8] =
+                unsafe { core::slice::from_raw_parts(b.as_ptr() as *const u8, b.len()) };
+
+            // Diff encoding path
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                let mut tmp = Vec::with_capacity(a_u8.len() + b_u8.len());
+                tmp.extend_from_slice(a_u8);
+                tmp.extend_from_slice(b_u8);
+                return diff.encode_blob(&tmp, writer);
+            }
+            let mut tmp = Vec::with_capacity(a_u8.len() + b_u8.len());
+            tmp.extend_from_slice(a_u8);
+            tmp.extend_from_slice(b_u8);
+            let raw_len = tmp.len();
+            // Skip compression for small payloads where overhead outweighs savings
+            if raw_len >= bytes::MIN_COMPRESS_LEN
+                && !bytes::looks_incompressible(&tmp)
+                && let Some(n) = bytes::compress_and_write(&tmp, writer)?
+            {
+                return Ok(n);
+            }
+            return bytes::write_flagged_raw(writer, &tmp, 0);
+        }
+
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for value in self {
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+impl<V: Decode + 'static> Decode for collections::VecDeque<V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        if core::any::TypeId::of::<V>() == core::any::TypeId::of::<u8>() {
+            // Diff decoding path
+            if let Some(ref mut c) = ctx
+                && let Some(ref mut diff) = c.diff
+                && diff.current_key.is_some()
+            {
+                let out = diff.decode_blob(reader)?;
+                let out_v: Vec<V> = unsafe { core::mem::transmute::<Vec<u8>, Vec<V>>(out) };
+                let mut deque = collections::VecDeque::with_capacity(out_v.len());
+                deque.extend(out_v);
+                return Ok(deque);
+            }
+
+            let flagged = Self::decode_len(reader)?;
+            let is_compressed = (flagged & 1) == 1;
+            let payload_len = flagged >> 1;
+            if is_compressed {
+                let mut comp = vec![0u8; payload_len];
+                let mut read = 0usize;
+                while read < payload_len {
+                    read += reader.read(&mut comp[read..])?;
+                }
+                let orig_len = bytes::zstd_content_size(&comp)?;
+                let out = bytes::zstd_decompress(&comp, orig_len)?;
+                // SAFETY: V == u8, so reinterpretation is sound
+                let out_v: Vec<V> = unsafe { core::mem::transmute::<Vec<u8>, Vec<V>>(out) };
+                let mut deque = collections::VecDeque::with_capacity(orig_len);
+                deque.extend(out_v);
+                return Ok(deque);
+            } else {
+                let mut out = vec![0u8; payload_len];
+                let mut read = 0usize;
+                while read < payload_len {
+                    read += reader.read(&mut out[read..])?;
+                }
+                let out_v: Vec<V> = unsafe { core::mem::transmute::<Vec<u8>, Vec<V>>(out) };
+                let mut deque = collections::VecDeque::with_capacity(payload_len);
+                deque.extend(out_v);
+                return Ok(deque);
+            }
+        }
+
+        let len = Self::decode_len(reader)?;
+        let mut deque = collections::VecDeque::with_capacity(len);
+        for _ in 0..len {
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            deque.push_back(value);
+        }
+        Ok(deque)
+    }
+}
+
+impl<V: Encode> Encode for collections::LinkedList<V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for value in self {
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+impl<V: Decode> Decode for collections::LinkedList<V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut list = collections::LinkedList::new();
+        for _ in 0..len {
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            list.push_back(value);
+        }
+        Ok(list)
+    }
+}
+
+impl<T: Encode> Encode for collections::BinaryHeap<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for value in self {
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+impl<T: Decode + Ord> Decode for collections::BinaryHeap<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut heap = collections::BinaryHeap::with_capacity(len);
+        for _ in 0..len {
+            let value = T::decode_ext(reader, ctx.as_deref_mut())?;
+            heap.push(value);
+        }
+        Ok(heap)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<K: Encode, V: Encode> Encode for std::collections::HashMap<K, V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for (key, value) in self {
+            total_written += key.encode_ext(writer, ctx.as_deref_mut())?;
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<K: Decode + Eq + std::hash::Hash, V: Decode> Decode for std::collections::HashMap<K, V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut map = std::collections::HashMap::with_capacity(len);
+        for _ in 0..len {
+            let key = K::decode_ext(reader, ctx.as_deref_mut())?;
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<V: Encode> Encode for std::collections::HashSet<V> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += Self::encode_len(self.len(), writer)?;
+        for value in self {
+            total_written += value.encode_ext(writer, ctx.as_deref_mut())?;
+        }
+        Ok(total_written)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<V: Decode + Eq + std::hash::Hash> Decode for std::collections::HashSet<V> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let len = Self::decode_len(reader)?;
+        let mut set = std::collections::HashSet::with_capacity(len);
+        for _ in 0..len {
+            let value = V::decode_ext(reader, ctx.as_deref_mut())?;
+            set.insert(value);
+        }
+        Ok(set)
+    }
+}
+
+impl<T: Encode> Encode for core::ops::Range<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += self.start.encode_ext(writer, ctx.as_deref_mut())?;
+        total_written += self.end.encode_ext(writer, ctx)?;
+        Ok(total_written)
+    }
+}
+
+impl<T: Decode> Decode for core::ops::Range<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let start = T::decode_ext(reader, ctx.as_deref_mut())?;
+        let end = T::decode_ext(reader, ctx)?;
+        Ok(core::ops::Range { start, end })
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode> Encode for core::ops::RangeInclusive<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        let mut total_written = 0;
+        total_written += self.start().encode_ext(writer, ctx.as_deref_mut())?;
+        total_written += self.end().encode_ext(writer, ctx)?;
+        Ok(total_written)
+    }
+}
+
+impl<T: Decode> Decode for core::ops::RangeInclusive<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, mut ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let start = T::decode_ext(reader, ctx.as_deref_mut())?;
+        let end = T::decode_ext(reader, ctx)?;
+        Ok(core::ops::RangeInclusive::new(start, end))
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode> Encode for core::ops::RangeFrom<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.start.encode_ext(writer, ctx)
+    }
+}
+
+impl<T: Decode> Decode for core::ops::RangeFrom<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let start = T::decode_ext(reader, ctx)?;
+        Ok(core::ops::RangeFrom { start })
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode> Encode for core::ops::RangeTo<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.end.encode_ext(writer, ctx)
+    }
+}
+
+impl<T: Decode> Decode for core::ops::RangeTo<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let end = T::decode_ext(reader, ctx)?;
+        Ok(core::ops::RangeTo { end })
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode> Encode for core::ops::RangeToInclusive<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.end.encode_ext(writer, ctx)
+    }
+}
+
+impl<T: Decode> Decode for core::ops::RangeToInclusive<T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        let end = T::decode_ext(reader, ctx)?;
+        Ok(core::ops::RangeToInclusive { end })
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for core::ops::RangeFull {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        _writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Decode for core::ops::RangeFull {
+    #[inline(always)]
+    fn decode_ext(_reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(core::ops::RangeFull {})
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl Encode for () {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        _writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Decode for () {
+    #[inline(always)]
+    fn decode_ext(_reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(())
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl<T: Encode> Encode for core::marker::PhantomData<T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        _writer: &mut impl Write,
+        _ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+impl<T: Decode> Decode for core::marker::PhantomData<T> {
+    #[inline(always)]
+    fn decode_ext(_reader: &mut impl Read, _ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(core::marker::PhantomData)
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: Encode + Clone> Encode for std::borrow::Cow<'_, T> {
+    #[inline(always)]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.as_ref().encode_ext(writer, ctx)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: Decode + Clone> Decode for std::borrow::Cow<'_, T> {
+    #[inline(always)]
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(std::borrow::Cow::Owned(T::decode_ext(reader, ctx)?))
+    }
+
+    fn decode_len(_reader: &mut impl Read) -> Result<usize> {
+        unimplemented!()
+    }
+}
+
+#[test]
+fn test_encode_decode_unit_type() {
+    let val = ();
+    let mut buf = [0u8; 1];
+    let n = val.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 0);
+    <()>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+}
+
+#[test]
+fn test_encode_decode_i16_all() {
+    for i in i16::MIN..=i16::MAX {
+        let val: i16 = i;
+        let mut buf = [0u8; 3];
+        let n = val.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+        let decoded = i16::decode(&mut Cursor::new(&buf[..n])).unwrap();
+        assert_eq!(decoded, val);
+    }
+}
+
+#[test]
+fn test_encode_decode_vec_of_i16_all() {
+    let values: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+    let mut buf = vec![0u8; 3 * values.len()];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert!(n < values.len() * 3);
+    let decoded = Vec::<i16>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_encode_decode_vec_of_many_small_u128() {
+    let values: Vec<u128> = (0..(u16::MAX / 2) as u128)
+        .chain(0..(u16::MAX / 2) as u128)
+        .collect();
+    let mut buf = vec![0u8; 3 * values.len()];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert!(n < values.len() * 3);
+    let decoded = Vec::<u128>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_encode_decode_vec_of_tiny_u128s() {
+    let values: Vec<u128> = (0..127).collect();
+    let mut buf = vec![0u8; values.len() + 1];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, values.len() + 1);
+    let decoded = Vec::<u128>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_encode_decode_bools() {
+    let values = vec![true, false, true, false, true];
+    let mut buf = vec![0u8; values.len() + 1];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, values.len() + 1);
+    let decoded = Vec::<bool>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_encode_decode_option() {
+    let values = vec![Some(42), None, Some(100), None, Some(200)];
+    let mut buf = [0u8; 12];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, buf.len());
+    let decoded = Vec::<Option<i32>>::decode(&mut Cursor::new(&buf[..n])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_encode_decode_arrays() {
+    let values: [u128; 5] = [1, 2, 3, 4, 5];
+    let mut buf = [0u8; 5];
+    let n = values.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 5);
+    let decoded: [u128; 5] = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[cfg(test)]
+#[derive(PartialEq, Debug)]
+struct NoDefault(u64);
+
+#[cfg(test)]
+impl Encode for NoDefault {
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> Result<usize> {
+        self.0.encode_ext(writer, ctx)
+    }
+}
+
+#[cfg(test)]
+impl Decode for NoDefault {
+    fn decode_ext(reader: &mut impl Read, ctx: Option<&mut DecoderContext>) -> Result<Self> {
+        Ok(Self(u64::decode_ext(reader, ctx)?))
+    }
+}
+
+#[test]
+fn test_nonzero_roundtrip() {
+    let unsigned = NonZeroU32::new(123).unwrap();
+    let signed = NonZeroI64::new(-987654321).unwrap();
+
+    let mut buf_unsigned = Vec::new();
+    encode(&unsigned, &mut buf_unsigned).unwrap();
+    let decoded_unsigned: NonZeroU32 = decode(&mut Cursor::new(&buf_unsigned)).unwrap();
+    assert_eq!(decoded_unsigned, unsigned);
+
+    let mut buf_signed = Vec::new();
+    encode(&signed, &mut buf_signed).unwrap();
+    let decoded_signed: NonZeroI64 = decode(&mut Cursor::new(&buf_signed)).unwrap();
+    assert_eq!(decoded_signed, signed);
+}
+
+#[test]
+fn test_nonzero_decode_zero_fails() {
+    let err: Result<NonZeroU16> = Decode::decode(&mut Cursor::new(&[0u8]));
+    assert!(matches!(err, Err(Error::InvalidData)));
+}
+
+#[test]
+fn test_encode_decode_nested_arrays_roundtrip() {
+    let values = [
+        [NoDefault(1), NoDefault(2), NoDefault(3)],
+        [NoDefault(4), NoDefault(5), NoDefault(6)],
+    ];
+
+    let mut encoded = Vec::new();
+    encode(&values, &mut encoded).unwrap();
+
+    let decoded: [[NoDefault; 3]; 2] = decode(&mut Cursor::new(&encoded)).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn test_tree_map_encode_decode() {
+    let mut map = collections::BTreeMap::new();
+    map.insert(1, 4);
+    map.insert(2, 5);
+    map.insert(3, 6);
+
+    let mut buf = [0u8; 7];
+    let n = map.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 7);
+
+    let decoded: collections::BTreeMap<i32, i32> =
+        Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, map);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn test_hash_map_encode_decode() {
+    let mut map = std::collections::HashMap::new();
+    map.insert(1, 4);
+    map.insert(2, 5);
+    map.insert(3, 6);
+
+    let mut buf = [0u8; 7];
+    let n = map.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 7);
+
+    let decoded: std::collections::HashMap<i32, i32> =
+        Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, map);
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn test_hash_set_encode_decode() {
+    let mut set = std::collections::HashSet::new();
+    set.insert(1);
+    set.insert(2);
+    set.insert(3);
+
+    let mut buf = [0u8; 4];
+    let n = set.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 4);
+
+    let decoded: std::collections::HashSet<i32> =
+        Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, set);
+}
+
+#[test]
+fn test_btree_set_encode_decode() {
+    let mut set = collections::BTreeSet::new();
+    set.insert(1);
+    set.insert(2);
+    set.insert(3);
+
+    let mut buf = [0u8; 4];
+    let n = set.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 4);
+
+    let decoded: collections::BTreeSet<i32> = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, set);
+}
+
+#[test]
+fn test_vec_deque_encode_decode() {
+    let mut deque = collections::VecDeque::new();
+    deque.push_back(1);
+    deque.push_back(2);
+    deque.push_back(3);
+
+    let mut buf = [0u8; 4];
+    let n = deque.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 4);
+
+    let decoded: collections::VecDeque<i32> = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, deque);
+}
+
+#[test]
+fn test_linked_list_encode_decode() {
+    let mut list = collections::LinkedList::new();
+    list.push_back(1);
+    list.push_back(2);
+    list.push_back(3);
+
+    let mut buf = [0u8; 4];
+    let n = list.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 4);
+
+    let decoded: collections::LinkedList<i32> = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, list);
+}
+
+#[test]
+fn test_binary_heap_encode_decode() {
+    let mut heap = collections::BinaryHeap::new();
+    heap.push(1);
+    heap.push(2);
+    heap.push(3);
+
+    let mut buf = [0u8; 4];
+    let n = heap.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 4);
+
+    let decoded: collections::BinaryHeap<i32> = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(
+        decoded.clone().into_sorted_vec(),
+        heap.clone().into_sorted_vec()
+    );
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn test_string_encode_decode() {
+    let value = "Hello, world!";
+    let mut buf = [0u8; 14];
+    let n = value.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 14);
+    let decoded: String = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, value);
+
+    let mut buf = [0u8; 14];
+    let value = "";
+    let n = value.encode(&mut Cursor::new(&mut buf[..])).unwrap();
+    assert_eq!(n, 1);
+    let decoded: String = Decode::decode(&mut Cursor::new(&buf[..])).unwrap();
+    assert_eq!(decoded, value);
+}
+
+#[test]
+fn test_compressed_bytes_roundtrip_vec() {
+    let data: Vec<u8> = (0..200u16).map(|i| (i % 251) as u8).collect();
+    let mut buf = Vec::new();
+    let n = data.encode(&mut buf).unwrap();
+    assert!(n > 0);
+    let rt: Vec<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, data);
+}
+
+#[test]
+fn test_compressed_bytes_roundtrip_slice() {
+    let data: Vec<u8> = (0..200u16).map(|i| (i % 251) as u8).collect();
+    let mut buf = Vec::new();
+    let n = (&data[..]).encode(&mut buf).unwrap();
+    assert!(n > 0);
+    let rt: Vec<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, data);
+}
+
+#[test]
+fn test_string_flag_raw_small_ascii() {
+    use crate::prelude::*;
+    let s = "Hello, Lencode!";
+    let mut buf = Vec::new();
+    s.encode(&mut buf).unwrap();
+
+    // Parse flagged header
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    let flag = flagged & 1;
+    let payload_len = flagged >> 1;
+    assert_eq!(flag, 0, "expected raw path for small ASCII string");
+    assert_eq!(payload_len, s.len());
+
+    // Verify raw payload equals original bytes
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(&buf[header.len()..], s.as_bytes());
+
+    // Round-trip decode
+    let rt: String = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, s);
+}
+
+#[test]
+fn test_string_flag_compressed_repetitive_ascii() {
+    use crate::prelude::*;
+    // Highly compressible ASCII
+    let s = "A".repeat(32 * 1024);
+    let mut buf = Vec::new();
+    s.encode(&mut buf).unwrap();
+
+    // Parse flagged header
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    let flag = flagged & 1;
+    let payload_len = flagged >> 1;
+    assert_eq!(flag, 1, "expected compressed path for repetitive string");
+
+    // Payload length matches buffer remainder
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(buf.len() - header.len(), payload_len);
+
+    // Verify decompression restores original
+    let payload = &buf[header.len()..];
+    let frame_len = crate::bytes::zstd_content_size(payload).unwrap();
+    assert_eq!(frame_len, s.len());
+    let manual = crate::bytes::zstd_decompress(payload, frame_len).unwrap();
+    assert_eq!(manual, s.as_bytes());
+
+    // Round-trip decode
+    let rt: String = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, s);
+}
+
+#[test]
+fn test_string_flag_compressed_unicode() {
+    use crate::prelude::*;
+    // Compressible Unicode string (multi-byte UTF-8)
+    let s = "😀".repeat(8192);
+    let mut buf = Vec::new();
+    s.encode(&mut buf).unwrap();
+
+    // Parse header and ensure compressed
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    assert_eq!(flagged & 1, 1);
+
+    // Round-trip decode
+    let rt: String = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, s);
+}
+
+#[test]
+fn test_string_flag_corrupted_compressed_payload_errors() {
+    use crate::prelude::*;
+    // Ensure compression path is used
+    let s = "X".repeat(4096);
+    let mut buf = Vec::new();
+    s.encode(&mut buf).unwrap();
+
+    // Get header length
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    assert_eq!(flagged & 1, 1);
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+
+    if buf.len() > header.len() + 10 {
+        let mut corrupted = buf.clone();
+        corrupted[header.len() + 10] ^= 0xFF;
+        let res: Result<String> = Decode::decode(&mut Cursor::new(&corrupted));
+        assert!(res.is_err());
+    }
+}
+
+#[test]
+fn test_bytes_flag_raw_for_small_incompressible_slice() {
+    use crate::prelude::*;
+    // Pattern unlikely to compress
+    let data: Vec<u8> = (0u16..64).map(|i| (i as u8).wrapping_mul(13)).collect();
+    let mut buf = Vec::new();
+    (&data[..]).encode(&mut buf).unwrap();
+
+    // Parse flagged header
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    let flag = flagged & 1;
+    let payload_len = flagged >> 1;
+    assert_eq!(flag, 0, "expected raw path for small incompressible slice");
+    assert_eq!(payload_len, data.len());
+
+    // Ensure payload bytes equal the original raw data
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(&buf[header.len()..], &data[..]);
+
+    // Full round-trip via Vec<u8>
+    let rt: Vec<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, data);
+}
+
+#[test]
+fn test_bytes_flag_compressed_for_repetitive_slice() {
+    use crate::prelude::*;
+    let data: Vec<u8> = vec![7; 4096];
+    let mut buf = Vec::new();
+    (&data[..]).encode(&mut buf).unwrap();
+
+    // Parse flagged header
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    let flag = flagged & 1;
+    let payload_len = flagged >> 1;
+    assert_eq!(flag, 1, "expected compressed path for repetitive slice");
+
+    // Header should be minimal; check the remainder length matches payload_len
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(buf.len() - header.len(), payload_len);
+
+    // Decompress payload manually and verify it matches
+    let payload = &buf[header.len()..];
+    let frame_len = crate::bytes::zstd_content_size(payload).unwrap();
+    assert_eq!(frame_len, data.len());
+    let manual = crate::bytes::zstd_decompress(payload, frame_len).unwrap();
+    assert_eq!(manual, data);
+
+    // Full round-trip via Vec<u8>
+    let rt: Vec<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, data);
+}
+
+#[test]
+fn test_vec_u8_flag_paths() {
+    use crate::prelude::*;
+    // Raw path
+    let raw: Vec<u8> = (0..80).collect();
+    let mut buf = Vec::new();
+    raw.encode(&mut buf).unwrap();
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    assert_eq!(flagged & 1, 0);
+    let len = flagged >> 1;
+    assert_eq!(len, raw.len());
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(&buf[header.len()..], &raw[..]);
+    let rt: Vec<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, raw);
+
+    // Compressed path
+    let comp: Vec<u8> = vec![0xAB; 8192];
+    let mut buf2 = Vec::new();
+    comp.encode(&mut buf2).unwrap();
+    let mut c2 = Cursor::new(&buf2);
+    let flagged2 = Lencode::decode_varint_u64(&mut c2).unwrap() as usize;
+    assert_eq!(flagged2 & 1, 1);
+    let payload_len = flagged2 >> 1;
+    let mut header2 = Vec::new();
+    Lencode::encode_varint_u64(flagged2 as u64, &mut header2).unwrap();
+    assert_eq!(buf2.len() - header2.len(), payload_len);
+    let payload = &buf2[header2.len()..];
+    let frame_len = crate::bytes::zstd_content_size(payload).unwrap();
+    assert_eq!(frame_len, comp.len());
+    let manual = crate::bytes::zstd_decompress(payload, frame_len).unwrap();
+    assert_eq!(manual, comp);
+    let rt2: Vec<u8> = Decode::decode(&mut Cursor::new(&buf2)).unwrap();
+    assert_eq!(rt2, comp);
+}
+
+#[test]
+fn test_vecdeque_u8_flag_paths_roundtrip() {
+    use crate::prelude::*;
+    use core::iter::FromIterator;
+    // Raw path likely
+    let raw_vec: Vec<u8> = (0..90).map(|i| (i as u8).wrapping_mul(37)).collect();
+    let raw = collections::VecDeque::from_iter(raw_vec.clone());
+    let mut buf = Vec::new();
+    raw.encode(&mut buf).unwrap();
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    assert_eq!(flagged & 1, 0);
+    let len = flagged >> 1;
+    assert_eq!(len, raw_vec.len());
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    assert_eq!(&buf[header.len()..], &raw_vec[..]);
+    let rt: collections::VecDeque<u8> = Decode::decode(&mut Cursor::new(&buf)).unwrap();
+    assert_eq!(rt, raw);
+
+    // Compressed path
+    let comp_vec: Vec<u8> = vec![0; 10_000];
+    let comp = collections::VecDeque::from_iter(comp_vec.clone());
+    let mut buf2 = Vec::new();
+    comp.encode(&mut buf2).unwrap();
+    let mut c2 = Cursor::new(&buf2);
+    let flagged2 = Lencode::decode_varint_u64(&mut c2).unwrap() as usize;
+    assert_eq!(flagged2 & 1, 1);
+    let payload_len = flagged2 >> 1;
+    let mut header2 = Vec::new();
+    Lencode::encode_varint_u64(flagged2 as u64, &mut header2).unwrap();
+    assert_eq!(buf2.len() - header2.len(), payload_len);
+    let payload = &buf2[header2.len()..];
+    let frame_len = crate::bytes::zstd_content_size(payload).unwrap();
+    assert_eq!(frame_len, comp_vec.len());
+    let manual = crate::bytes::zstd_decompress(payload, frame_len).unwrap();
+    assert_eq!(manual, comp_vec);
+    let rt2: collections::VecDeque<u8> = Decode::decode(&mut Cursor::new(&buf2)).unwrap();
+    assert_eq!(rt2, comp);
+}
+
+#[test]
+fn test_bytes_flag_corrupted_compressed_payload_errors() {
+    use crate::prelude::*;
+    // Ensure we get a compressed path
+    let data: Vec<u8> = vec![1; 2048];
+    let mut buf = Vec::new();
+    (&data[..]).encode(&mut buf).unwrap();
+    let mut c = Cursor::new(&buf);
+    let flagged = Lencode::decode_varint_u64(&mut c).unwrap() as usize;
+    assert_eq!(flagged & 1, 1);
+    let mut header = Vec::new();
+    Lencode::encode_varint_u64(flagged as u64, &mut header).unwrap();
+    // Corrupt a byte in the payload (if present)
+    if buf.len() > header.len() {
+        let idx = header.len() + core::cmp::min(10, buf.len() - header.len() - 1);
+        // Flip some bits
+        let mut corrupted = buf.clone();
+        corrupted[idx] ^= 0xFF;
+        // Decoding should fail
+        let res: Result<Vec<u8>> = Decode::decode(&mut Cursor::new(&corrupted));
+        assert!(res.is_err());
+    }
+}

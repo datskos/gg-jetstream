@@ -43,7 +43,8 @@ use crate::limits::{
 };
 use crate::transactions::{
     CompiledInstruction, InnerInstruction, LegacyMessage, Reward, RewardType, TokenAmount,
-    Transaction, TransactionStatus, TransactionTokenBalance, V0Message, VersionedMessage,
+    Transaction, TransactionStatus, TransactionTokenBalance, V0Message, V1Message,
+    VersionedMessage,
 };
 use crate::zero_vec::ZeroVec;
 
@@ -440,6 +441,7 @@ pub fn reward_type_from_upstream(value: solana_reward_info::RewardType) -> Rewar
         solana_reward_info::RewardType::Rent => RewardType::Rent,
         solana_reward_info::RewardType::Staking => RewardType::Staking,
         solana_reward_info::RewardType::Voting => RewardType::Voting,
+        solana_reward_info::RewardType::DeactivatedStake => RewardType::DeactivatedStake,
     }
 }
 
@@ -453,18 +455,26 @@ pub fn reward_from_status_reward(
         post_balance: src.post_balance,
         reward_type: src.reward_type.map(reward_type_from_upstream),
         commission: src.commission,
+        commission_bps: src.commission_bps,
     })
 }
 
 /// Builds a horizon reward record from a keyed `RewardInfo` (the shape the
 /// runtime emits at block boundaries).
-pub fn reward_from_info(pubkey: Address, info: &solana_reward_info::RewardInfo) -> Reward {
+pub fn reward_from_info(
+    pubkey: Address,
+    reward_type: solana_reward_info::RewardType,
+    lamports: i64,
+    post_balance: u64,
+    commission_bps: Option<u16>,
+) -> Reward {
     Reward {
         pubkey,
-        lamports: info.lamports,
-        post_balance: info.post_balance,
-        reward_type: Some(reward_type_from_upstream(info.reward_type)),
-        commission: info.commission,
+        lamports,
+        post_balance,
+        reward_type: Some(reward_type_from_upstream(reward_type)),
+        commission: commission_bps.and_then(|bps| u8::try_from(bps / 100).ok()),
+        commission_bps,
     }
 }
 
@@ -517,7 +527,7 @@ fn populate_message_common(
 }
 
 /// Fills a horizon [`VersionedMessage`] in place from the upstream message,
-/// preserving the legacy/v0 distinction.
+/// preserving the legacy/v0/v1 distinction.
 pub fn populate_message(
     dst: &mut VersionedMessage,
     src: &solana_message::VersionedMessage,
@@ -569,6 +579,23 @@ pub fn populate_message(
                 slot.writable_indexes.set(&lookup.writable_indexes);
                 slot.readonly_indexes.set(&lookup.readonly_indexes);
             }
+        }
+        solana_message::VersionedMessage::V1(m) => {
+            let dst: &mut V1Message = dst.force_v1_mut();
+            dst.header.num_required_signatures = m.header.num_required_signatures;
+            dst.header.num_readonly_signed_accounts = m.header.num_readonly_signed_accounts;
+            dst.header.num_readonly_unsigned_accounts = m.header.num_readonly_unsigned_accounts;
+            dst.config.priority_fee = m.config.priority_fee;
+            dst.config.compute_unit_limit = m.config.compute_unit_limit;
+            dst.config.loaded_accounts_data_size_limit = m.config.loaded_accounts_data_size_limit;
+            dst.config.heap_size = m.config.heap_size;
+            dst.lifetime_specifier = m.lifetime_specifier;
+            populate_message_common(
+                &mut dst.account_keys,
+                &mut dst.instructions,
+                &m.account_keys,
+                &m.instructions,
+            )?;
         }
     }
     Ok(())
@@ -736,9 +763,9 @@ mod tests {
     use solana_account_decoder_client_types::token::UiTokenAmount;
     use solana_hash::Hash;
     use solana_message::compiled_instruction::CompiledInstruction as UpstreamIx;
-    use solana_message::{MessageHeader, v0};
+    use solana_message::{MessageHeader, v0, v1};
     use solana_signature::Signature;
-    use solana_transaction_context::TransactionReturnData;
+    use solana_transaction_context::transaction::TransactionReturnData;
     use solana_transaction_status::{
         InnerInstruction as UpstreamInnerIx, InnerInstructions as UpstreamInnerIxGroup,
         TransactionTokenBalance as TbUpstream,
@@ -852,6 +879,7 @@ mod tests {
                 post_balance: 1_000,
                 reward_type: Some(solana_reward_info::RewardType::Rent),
                 commission: None,
+                commission_bps: Some(125),
             }]),
             loaded_addresses: Default::default(),
             return_data: Some(TransactionReturnData {
@@ -953,6 +981,7 @@ mod tests {
         let rewards = dst.rewards.as_ref().expect("rewards");
         assert_eq!(rewards.as_slice()[0].lamports, -42);
         assert_eq!(rewards.as_slice()[0].reward_type, Some(RewardType::Rent));
+        assert_eq!(rewards.as_slice()[0].commission_bps, Some(125));
 
         let rd = dst.return_data.as_ref().expect("return data");
         assert_eq!(rd.data.as_slice(), &[1, 2, 3, 4]);
@@ -990,6 +1019,56 @@ mod tests {
         assert!(dst.status.is_ok());
         assert_eq!(dst.loaded_writable_addresses.len(), 0);
         assert!(dst.inner_instructions.is_none());
+    }
+
+    #[test]
+    fn populate_transaction_roundtrips_v1() {
+        run_big_stack(|| {
+            let lifetime_specifier = Hash::new_unique();
+            let tx = VersionedTransaction {
+                signatures: vec![Signature::from([7u8; 64])],
+                message: solana_message::VersionedMessage::V1(v1::Message {
+                    header: MessageHeader {
+                        num_required_signatures: 1,
+                        num_readonly_signed_accounts: 0,
+                        num_readonly_unsigned_accounts: 1,
+                    },
+                    config: v1::TransactionConfig {
+                        priority_fee: Some(42),
+                        compute_unit_limit: Some(200_000),
+                        loaded_accounts_data_size_limit: Some(64 * 1024),
+                        heap_size: Some(32 * 1024),
+                    },
+                    lifetime_specifier,
+                    account_keys: vec![pk(1), pk(2)],
+                    instructions: vec![UpstreamIx {
+                        program_id_index: 1,
+                        accounts: vec![0],
+                        data: vec![9, 8, 7],
+                    }],
+                }),
+            };
+            let mut dst = Transaction::new_boxed();
+            populate_transaction(&mut dst, &tx, &TransactionStatusMeta::default())
+                .expect("populate v1");
+
+            let VersionedMessage::V1(message) = &dst.message else {
+                panic!("expected v1 message");
+            };
+            assert_eq!(message.config.priority_fee, Some(42));
+            assert_eq!(message.config.compute_unit_limit, Some(200_000));
+            assert_eq!(
+                message.config.loaded_accounts_data_size_limit,
+                Some(64 * 1024)
+            );
+            assert_eq!(message.config.heap_size, Some(32 * 1024));
+            assert_eq!(message.lifetime_specifier, lifetime_specifier);
+            assert_eq!(message.account_keys.len(), 2);
+            assert_eq!(
+                message.instructions.as_slice()[0].data.as_slice(),
+                &[9, 8, 7]
+            );
+        });
     }
 
     #[test]

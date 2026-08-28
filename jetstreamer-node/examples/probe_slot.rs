@@ -102,6 +102,7 @@ impl BlockMetadataNotifier for Probe {
         _block_height: Option<u64>,
         executed_transaction_count: u64,
         entry_count: u64,
+        _commission_rate_in_basis_points: bool,
     ) {
         if slot == u64::MAX {
             return; // unload sentinel

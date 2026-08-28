@@ -1,13 +1,11 @@
 //! Agave 4.2 scheduler cost and priority over borrowed transaction data.
 //!
-//! Jetstreamer currently links Agave 3, while the reference Geyser plugin
-//! links Agave 4.2. The two dependency graphs cannot coexist because several
-//! Solana crates pin mutually exclusive versions. For legacy and v0 messages,
 //! Agave 4.2's summed scheduler cost is the five scalar components reproduced
-//! below. Account-allocation cost is tracked separately by Agave but is not
-//! included in `TransactionCost::sum()`.
+//! below. V1 message configuration is applied directly, while legacy and v0
+//! compute-budget instructions are decoded locally. Account-allocation cost is
+//! tracked separately by Agave but is not included in `TransactionCost::sum()`.
 
-use super::{InstructionView, MessageHeaderView, ResolvedAccounts};
+use super::{InstructionView, MessageHeaderView, ResolvedAccounts, V1TransactionConfigView};
 
 const BASE_FEE_BURN_PERCENT: u64 = 50;
 const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
@@ -68,11 +66,12 @@ impl SignatureDetails {
     }
 }
 
-/// Mirrors the referenced Agave 4.2 scheduler metrics for legacy/v0 messages.
+/// Mirrors Agave 4.2 scheduler metrics for legacy, v0, and v1 messages.
 pub(super) fn calculate<'transaction, I>(
     num_signatures: usize,
     header: MessageHeaderView,
     is_legacy: bool,
+    v1_config: Option<V1TransactionConfigView>,
     accounts: ResolvedAccounts<'transaction>,
     instructions: I,
 ) -> Option<SchedulerMetrics>
@@ -89,7 +88,7 @@ where
     if num_signatures != required_signatures
         || readonly_signed > required_signatures
         || readonly_unsigned > unsigned_static
-        || (is_legacy
+        || ((is_legacy || v1_config.is_some())
             && (!accounts.loaded_writable.is_empty() || !accounts.loaded_readonly.is_empty()))
     {
         return None;
@@ -110,7 +109,10 @@ where
         return None;
     }
 
-    let configuration = scheduler_configuration(accounts, instructions.clone())?;
+    let configuration = match v1_config {
+        Some(config) => scheduler_configuration_v1(config)?,
+        None => scheduler_configuration_legacy_and_v0(accounts, instructions.clone())?,
+    };
     let signature_details = signature_details(
         u64::from(header.num_required_signatures),
         accounts,
@@ -156,7 +158,28 @@ where
     })
 }
 
-fn scheduler_configuration<'transaction, I>(
+fn scheduler_configuration_v1(config: V1TransactionConfigView) -> Option<SchedulerConfiguration> {
+    let heap_size = config.heap_size.unwrap_or(MIN_HEAP_FRAME_BYTES);
+    if !(MIN_HEAP_FRAME_BYTES..=MAX_HEAP_FRAME_BYTES).contains(&heap_size)
+        || !heap_size.is_multiple_of(1024)
+    {
+        return None;
+    }
+
+    Some(SchedulerConfiguration {
+        compute_unit_limit: config
+            .compute_unit_limit
+            .unwrap_or_default()
+            .min(MAX_COMPUTE_UNIT_LIMIT),
+        priority_fee_lamports: config.priority_fee.unwrap_or_default(),
+        loaded_accounts_data_size_limit: config
+            .loaded_accounts_data_size_limit
+            .unwrap_or_default()
+            .min(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES),
+    })
+}
+
+fn scheduler_configuration_legacy_and_v0<'transaction, I>(
     accounts: ResolvedAccounts<'transaction>,
     instructions: I,
 ) -> Option<SchedulerConfiguration>

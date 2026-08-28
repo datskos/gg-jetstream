@@ -369,7 +369,7 @@ impl JetstreamerRunner {
     /// Sets the log level used when [`JetstreamerRunner::run`] initializes logging.
     ///
     /// Logging is installed by `run` — not here — because the backend depends on the parsed
-    /// configuration: plain `solana_logger` output normally, or the TUI's in-memory log
+    /// configuration: plain `agave_logger` output normally, or the TUI's in-memory log
     /// capture when `--tui` is active (the `log` crate only allows one global logger, so
     /// installing eagerly would lock the TUI out and let log lines garble its display).
     pub fn with_log_level(mut self, log_level: impl Into<String>) -> Self {
@@ -467,7 +467,7 @@ impl JetstreamerRunner {
             // The TUI owns the terminal; capture logs into its ring buffer instead of stderr.
             tui::init_logging(&self.log_level);
         } else {
-            solana_logger::setup_with_default(&logger_filter(&self.log_level));
+            agave_logger::setup_with_default(&logger_filter(&self.log_level));
         }
 
         if let Ok(index_url) = get_index_base_url() {

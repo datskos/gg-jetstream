@@ -1,0 +1,9 @@
+[target.s390x-unknown-linux-gnu]
+# Big-endian CI target we keep enabled
+image = "ghcr.io/cross-rs/s390x-unknown-linux-gnu:0.2.5"
+pre-build = [
+  "dpkg --add-architecture s390x",
+  "apt-get update",
+  "apt-get install -y --no-install-recommends pkg-config libssl-dev:s390x zlib1g-dev:s390x",
+]
+

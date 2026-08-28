@@ -2,7 +2,7 @@ use jetstreamer_utils::{start, stop_sync};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    solana_logger::setup_with_default("info");
+    agave_logger::setup_with_default("info");
     ctrlc::set_handler(|| {
         stop_sync();
     })

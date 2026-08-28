@@ -10,6 +10,7 @@ keywords.workspace = true
 
 [dependencies]
 agave-snapshots.workspace = true
+agave-fs.workspace = true
 cid.workspace = true
 # Global allocator (same choice as agave-validator): glibc malloc never returns
 # the accounts-db churn to the OS (anon RSS grew ~520 GiB per replayed epoch →
@@ -43,7 +44,7 @@ solana-genesis-utils.workspace = true
 solana-geyser-plugin-manager.workspace = true
 solana-hash.workspace = true
 solana-ledger.workspace = true
-solana-logger.workspace = true
+agave-logger.workspace = true
 solana-pubkey.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true

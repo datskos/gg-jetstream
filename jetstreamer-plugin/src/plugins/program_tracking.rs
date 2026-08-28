@@ -7,7 +7,6 @@ use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_address::Address;
-use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
@@ -93,10 +92,8 @@ impl Plugin for ProgramTrackingPlugin {
     ) -> PluginFuture<'a> {
         async move {
             let message = &transaction.transaction.message;
-            let (account_keys, instructions) = match message {
-                VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
-                VersionedMessage::V0(msg) => (&msg.account_keys, &msg.instructions),
-            };
+            let account_keys = message.static_account_keys();
+            let instructions = message.instructions();
             if instructions.is_empty() {
                 return Ok(());
             }

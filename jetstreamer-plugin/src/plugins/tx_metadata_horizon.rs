@@ -15,8 +15,8 @@ use crate::horizon::{Consumption, HorizonPlugin, Output, PluginWorker};
 
 use super::tx_metadata::{
     HORIZON_FLUSH_INTERVAL_SLOTS, InstructionView, MessageHeaderView, ResolvedAccounts,
-    TxMetadataInput, TxMetadataRow, ensure_tx_metadata_table, parse_tx_metadata,
-    write_tx_metadata_rows,
+    TxMetadataInput, TxMetadataRow, V1TransactionConfigView, ensure_tx_metadata_table,
+    parse_tx_metadata, write_tx_metadata_rows,
 };
 
 #[derive(Default)]
@@ -26,18 +26,32 @@ struct TxMetadataWorker {
 
 impl PluginWorker for TxMetadataWorker {
     fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &Transaction) {
-        let (header, static_keys, instructions, is_legacy) = match &tx.message {
+        let (header, static_keys, instructions, is_legacy, v1_config) = match &tx.message {
             VersionedMessage::Legacy(message) => (
                 message.header,
                 message.account_keys.as_slice(),
                 message.instructions.as_slice(),
                 true,
+                None,
             ),
             VersionedMessage::V0(message) => (
                 message.header,
                 message.account_keys.as_slice(),
                 message.instructions.as_slice(),
                 false,
+                None,
+            ),
+            VersionedMessage::V1(message) => (
+                message.header,
+                message.account_keys.as_slice(),
+                message.instructions.as_slice(),
+                false,
+                Some(V1TransactionConfigView {
+                    priority_fee: message.config.priority_fee,
+                    compute_unit_limit: message.config.compute_unit_limit,
+                    loaded_accounts_data_size_limit: message.config.loaded_accounts_data_size_limit,
+                    heap_size: message.config.heap_size,
+                }),
             ),
         };
         let accounts = ResolvedAccounts::new(
@@ -56,6 +70,7 @@ impl PluginWorker for TxMetadataWorker {
                     num_readonly_unsigned_accounts: header.num_readonly_unsigned_accounts,
                 },
                 is_legacy,
+                v1_config,
                 fee: tx.fee,
                 compute_units_consumed: tx.compute_units_consumed,
                 is_success: tx.status.is_ok(),

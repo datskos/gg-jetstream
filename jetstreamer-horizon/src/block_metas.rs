@@ -480,6 +480,7 @@ mod tests {
                 post_balance: i as u64 * 2,
                 reward_type: None,
                 commission: None,
+                commission_bps: None,
             });
         }
         let mut buf = vec![0u8; 4 << 20];

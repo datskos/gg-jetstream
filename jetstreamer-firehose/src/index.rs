@@ -1890,7 +1890,7 @@ mod tests {
     fn init_logger() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
-            solana_logger::setup_with_default("info");
+            agave_logger::setup_with_default("info");
         });
     }
 

@@ -241,7 +241,7 @@ fn parse_range(s: &str) -> (u64, u64) {
 
 #[tokio::main]
 async fn main() {
-    solana_logger::setup_with_default("info");
+    agave_logger::setup_with_default("info");
 
     let mut args = std::env::args().skip(1);
     let range = args.next().unwrap_or_else(|| usage());

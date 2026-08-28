@@ -6,7 +6,6 @@ use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_address::Address;
-use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
@@ -97,10 +96,7 @@ impl Plugin for PubkeyStatsPlugin {
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move {
-            let account_keys = match &transaction.transaction.message {
-                VersionedMessage::Legacy(msg) => &msg.account_keys,
-                VersionedMessage::V0(msg) => &msg.account_keys,
-            };
+            let account_keys = transaction.transaction.message.static_account_keys();
             if account_keys.is_empty() {
                 return Ok(());
             }

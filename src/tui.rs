@@ -145,7 +145,7 @@ impl log::Log for RingLogger {
     fn flush(&self) {}
 }
 
-/// Installs the ring-buffer logger. Call instead of `solana_logger` setup when the TUI owns
+/// Installs the ring-buffer logger. Call instead of `agave_logger` setup when the TUI owns
 /// the terminal. `level` accepts the leading level token of a filter string like `"info"`.
 pub fn init_logging(level: &str) {
     let max_level = level

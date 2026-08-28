@@ -11,13 +11,13 @@ use crate::pubkey_prime::POPULAR_PUBKEYS;
 
 /// Magic bytes opening every horizon archive file ("JSHZN" + version byte
 /// space + two NULs).
-pub const MAGIC: [u8; 8] = *b"JSHZN1\0\0";
+pub const MAGIC: [u8; 8] = *b"JSHZN2\0\0";
 
 /// Magic bytes closing every horizon archive file (last 8 bytes).
-pub const MAGIC_END: [u8; 8] = *b"\0\0NZHSJ1";
+pub const MAGIC_END: [u8; 8] = *b"\0\0NZHSJ2";
 
 /// Current format version, recorded in [`FileHeader`].
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Default number of slots per bucket (encoder-state reset / seek
 /// granularity). See the module docs for the tradeoff discussion.

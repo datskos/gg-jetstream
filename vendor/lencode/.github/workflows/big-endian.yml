@@ -1,0 +1,38 @@
+name: Big Endian
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  be-tests:
+    name: cross test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - s390x-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Test (workspace, default features)
+        run: |
+          cross test --workspace --target ${{ matrix.target }}
+
+      - name: Test (workspace, std feature)
+        run: |
+          cross test --workspace --features std --target ${{ matrix.target }}

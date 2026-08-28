@@ -10,9 +10,9 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition = "2024"
 name = "solana-svm"
-version = "3.1.12"
+version = "4.2.0"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 build = false
 autolib = false
@@ -26,28 +26,60 @@ documentation = "https://docs.rs/solana-svm"
 readme = false
 license = "Apache-2.0"
 repository = "https://github.com/anza-xyz/agave"
+resolver = "2"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
 
 [features]
 agave-unstable-api = []
+conformance = [
+    "dep:agave-feature-set",
+    "dep:agave-precompiles",
+    "dep:bincode",
+    "dep:prost",
+    "dep:protosol",
+    "dep:solana-poseidon",
+    "dep:solana-vote-program",
+    "dep:solana-zk-elgamal-proof-program",
+    "dep:xxhash-rust",
+    "dev-context-only-utils",
+    "solana-instruction-error/serde",
+    "solana-pubkey/default",
+]
+default = ["metrics"]
 dev-context-only-utils = [
     "dep:qualifier_attr",
+    "dep:solana-bpf-loader-program",
+    "dep:solana-compute-budget",
+    "dep:solana-compute-budget-program",
+    "dep:solana-instruction-error",
+    "dep:solana-precompile-error",
+    "dep:solana-syscalls",
+    "dep:solana-system-program",
     "solana-program-runtime/dev-context-only-utils",
+]
+dummy-for-ci-check = [
+    "conformance",
+    "metrics",
 ]
 frozen-abi = [
     "dep:solana-frozen-abi",
     "dep:solana-frozen-abi-macro",
     "solana-program-runtime/frozen-abi",
 ]
+metrics = [
+    "solana-bpf-loader-program/metrics",
+    "solana-program-runtime/metrics",
+]
 shuttle-test = [
     "solana-bpf-loader-program/shuttle-test",
-    "solana-loader-v4-program/shuttle-test",
     "solana-program-runtime/shuttle-test",
     "solana-svm-type-overrides/shuttle-test",
 ]
-svm-internal = []
+svm-internal = ["dep:qualifier_attr"]
 
 [lib]
 name = "solana_svm"
@@ -66,14 +98,36 @@ path = "tests/integration_test.rs"
 name = "mock_bank"
 path = "tests/mock_bank.rs"
 
+[dependencies.agave-feature-set]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+
+[dependencies.agave-precompiles]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+
 [dependencies.ahash]
-version = "0.8.11"
+version = "0.8.12"
+
+[dependencies.bincode]
+version = "1.3.3"
+optional = true
 
 [dependencies.log]
-version = "0.4.28"
+version = "0.4.32"
 
 [dependencies.percentage]
 version = "0.1.0"
+
+[dependencies.prost]
+version = "0.11"
+optional = true
+
+[dependencies.protosol]
+version = "=9.0.1"
+optional = true
 
 [dependencies.qualifier_attr]
 version = "0.2.2"
@@ -88,134 +142,180 @@ features = [
 ]
 
 [dependencies.solana-account]
-version = "3.2.0"
+version = ">=4.3.1,<4.4.0"
+
+[dependencies.solana-bpf-loader-program]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+default-features = false
 
 [dependencies.solana-clock]
-version = "3.0.0"
+version = ">=3.0.1,<3.2.0"
+
+[dependencies.solana-compute-budget]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+
+[dependencies.solana-compute-budget-program]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
 
 [dependencies.solana-fee-structure]
 version = "3.0.0"
 
 [dependencies.solana-frozen-abi]
-version = "3.0.1"
+version = ">=3.7.0,<3.8.0"
 features = ["frozen-abi"]
 optional = true
 
 [dependencies.solana-frozen-abi-macro]
-version = "3.0.1"
+version = "3.6.0"
 features = ["frozen-abi"]
 optional = true
 
 [dependencies.solana-hash]
-version = "3.1.0"
+version = ">=4.4.0,<4.6.0"
 
 [dependencies.solana-instruction]
-version = "3.0.0"
+version = ">=3.4.0,<3.5.0"
 features = ["std"]
 
+[dependencies.solana-instruction-error]
+version = ">=2.4.0,<2.5.0"
+optional = true
+
 [dependencies.solana-instructions-sysvar]
-version = "3.0.0"
+version = "4.0.0"
 
 [dependencies.solana-loader-v3-interface]
-version = "6.1.0"
+version = "7.0.0"
 features = ["bincode"]
 
 [dependencies.solana-loader-v4-interface]
 version = "3.1.0"
 
-[dependencies.solana-loader-v4-program]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
-
 [dependencies.solana-message]
-version = "3.0.1"
+version = ">=4.2.3,<4.5.0"
 
 [dependencies.solana-nonce]
-version = "3.0.0"
+version = ">=3.2.0,<3.3.0"
 
 [dependencies.solana-nonce-account]
+version = ">=4.1.0,<4.2.0"
+features = ["wincode"]
+
+[dependencies.solana-poseidon]
+version = "4.0.0"
+optional = true
+
+[dependencies.solana-precompile-error]
 version = "3.0.0"
+optional = true
 
 [dependencies.solana-program-entrypoint]
-version = "3.1.0"
+version = "3.1.1"
 
 [dependencies.solana-program-pack]
-version = "3.0.0"
+version = "3.1.0"
 
 [dependencies.solana-program-runtime]
-version = "=3.1.12"
-features = [
-    "agave-unstable-api",
-    "metrics",
-]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
 
 [dependencies.solana-pubkey]
-version = "3.0.0"
+version = ">=4.2.0,<4.3.0"
 default-features = false
 
 [dependencies.solana-rent]
-version = "3.0.0"
+version = ">=4.2.1,<4.4.0"
 
 [dependencies.solana-sdk-ids]
-version = "3.0.0"
+version = "3.1.0"
 
 [dependencies.solana-svm-callback]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-feature-set]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-log-collector]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-measure]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-timings]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-transaction]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
+version = ">=4.2.0,<4.3.0"
 
 [dependencies.solana-svm-type-overrides]
-version = "=3.1.12"
+version = "=4.2.0"
 features = ["agave-unstable-api"]
 
+[dependencies.solana-syscalls]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+default-features = false
+
 [dependencies.solana-system-interface]
-version = "2.0"
+version = ">=3.2.0,<3.3.0"
+features = [
+    "alloc",
+    "bincode",
+    "serde",
+    "wincode",
+]
+
+[dependencies.solana-system-program]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
 
 [dependencies.solana-sysvar-id]
-version = "3.0.0"
+version = "3.1.0"
 
 [dependencies.solana-transaction-context]
-version = "=3.1.12"
+version = "=4.2.0"
 features = [
     "agave-unstable-api",
     "bincode",
 ]
 
 [dependencies.solana-transaction-error]
-version = "3.0.0"
+version = ">=3.3.1,<3.4.0"
+
+[dependencies.solana-vote-program]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
+default-features = false
+
+[dependencies.solana-zk-elgamal-proof-program]
+version = "=4.2.0"
+features = ["agave-unstable-api"]
+optional = true
 
 [dependencies.spl-generic-token]
 version = "2.0.0"
 
 [dependencies.thiserror]
-version = "2.0.17"
+version = "2.0.18"
 
-[dev-dependencies.agave-logger]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
-
-[dev-dependencies.agave-syscalls]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
+[dependencies.xxhash-rust]
+version = "0.8.5"
+features = ["xxh64"]
+optional = true
 
 [dev-dependencies.assert_matches]
 version = "1.5.0"
@@ -223,11 +323,11 @@ version = "1.5.0"
 [dev-dependencies.bincode]
 version = "1.3.3"
 
-[dev-dependencies.ed25519-dalek]
-version = "=1.0.1"
+[dev-dependencies.env_logger]
+version = "0.11.10"
 
 [dev-dependencies.libsecp256k1]
-version = "0.6.0"
+version = "0.7.2"
 features = [
     "std",
     "static-context",
@@ -237,42 +337,29 @@ default-features = false
 [dev-dependencies.openssl]
 version = "0.10"
 
-[dev-dependencies.rand0-7]
-version = "0.7"
-package = "rand"
+[dev-dependencies.rand]
+version = "0.9.4"
 
 [dev-dependencies.shuttle]
 version = "0.7.1"
 
-[dev-dependencies.solana-bpf-loader-program]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
-
 [dev-dependencies.solana-clock]
-version = "3.0.0"
-
-[dev-dependencies.solana-compute-budget]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
+version = ">=3.0.1,<3.2.0"
 
 [dev-dependencies.solana-compute-budget-interface]
 version = "3.0.0"
-
-[dev-dependencies.solana-compute-budget-program]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
 
 [dev-dependencies.solana-ed25519-program]
 version = "3.0.0"
 
 [dev-dependencies.solana-epoch-schedule]
-version = "3.0.0"
+version = ">=3.2.0,<3.3.0"
 
 [dev-dependencies.solana-fee-calculator]
-version = "3.0.0"
+version = ">=3.2.2,<3.3.0"
 
 [dev-dependencies.solana-keypair]
-version = "3.0.1"
+version = "3.1.2"
 
 [dev-dependencies.solana-native-token]
 version = "3.0.0"
@@ -280,32 +367,21 @@ version = "3.0.0"
 [dev-dependencies.solana-precompile-error]
 version = "3.0.0"
 
-[dev-dependencies.solana-program-binaries]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
-
-[dev-dependencies.solana-program-runtime]
-version = "=3.1.12"
-features = [
-    "agave-unstable-api",
-    "dev-context-only-utils",
-]
-
 [dev-dependencies.solana-pubkey]
-version = "3.0.0"
+version = ">=4.2.0,<4.3.0"
 features = ["rand"]
 default-features = false
 
 [dev-dependencies.solana-rent]
-version = "3.0.0"
+version = ">=4.2.1,<4.4.0"
 
 [dev-dependencies.solana-sbpf]
-version = "=0.13.1"
+version = "=0.21.1"
 features = ["jit"]
 default-features = false
 
 [dev-dependencies.solana-secp256k1-program]
-version = "3.0.0"
+version = "3.0.1"
 features = ["bincode"]
 
 [dev-dependencies.solana-secp256r1-program]
@@ -313,37 +389,25 @@ version = "3.0.0"
 features = ["openssl-vendored"]
 
 [dev-dependencies.solana-signature]
-version = "3.1.0"
+version = ">=3.4.1,<3.5.0"
 features = ["rand"]
 default-features = false
 
 [dev-dependencies.solana-signer]
-version = "3.0.0"
-
-[dev-dependencies.solana-system-program]
-version = "=3.1.12"
-features = ["agave-unstable-api"]
+version = "3.0.1"
 
 [dev-dependencies.solana-system-transaction]
-version = "3.0.0"
+version = ">=4.0.0,<4.1.0"
 
 [dev-dependencies.solana-sysvar]
-version = "3.0.0"
+version = ">=4.0.0,<4.2.0"
 
 [dev-dependencies.solana-transaction]
-version = "3.0.2"
+version = ">=4.1.4,<4.2.0"
 features = ["dev-context-only-utils"]
 
-[dev-dependencies.solana-transaction-context]
-version = "=3.1.12"
-features = [
-    "agave-unstable-api",
-    "bincode",
-    "dev-context-only-utils",
-]
-
 [dev-dependencies.spl-token-interface]
-version = "2.0.0"
+version = "3.0.0"
 
 [dev-dependencies.test-case]
 version = "3.3.1"
@@ -352,12 +416,9 @@ version = "3.3.1"
 arithmetic_side_effects = "deny"
 default_trait_access = "deny"
 manual_let_else = "deny"
+new_without_default = "allow"
+uninlined_format_args = "deny"
 used_underscore_binding = "deny"
-
-[lints.rust]
-# jetstreamer patch: registry builds cap lints; vendored path builds must not
-# inherit upstream CI strictness (new dep versions introduce new deprecations).
-warnings = "warn"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
@@ -365,4 +426,5 @@ priority = 0
 check-cfg = [
     'cfg(target_os, values("solana"))',
     'cfg(feature, values("frozen-abi", "no-entrypoint"))',
+    'cfg(target_arch, values("sbf"))',
 ]

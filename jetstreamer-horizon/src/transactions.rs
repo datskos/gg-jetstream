@@ -202,6 +202,57 @@ impl V0Message {
     }
 }
 
+/// Compute-budget configuration carried inline by a v1 transaction message.
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct V1TransactionConfig {
+    pub priority_fee: Option<u64>,
+    pub compute_unit_limit: Option<u32>,
+    pub loaded_accounts_data_size_limit: Option<u32>,
+    pub heap_size: Option<u32>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct V1Message {
+    pub header: MessageHeader,
+    pub config: V1TransactionConfig,
+    pub lifetime_specifier: Hash,
+    pub account_keys: ZeroVec<MAX_TX_ACCOUNTS, Address>,
+    pub instructions: ZeroVec<MAX_TX_INSTRUCTIONS, CompiledInstruction>,
+}
+
+impl V1Message {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.header = MessageHeader::default();
+        self.config = V1TransactionConfig::default();
+        self.lifetime_specifier = Hash::default();
+        self.account_keys.clear();
+        for ix in self.instructions.iter_mut() {
+            ix.clear();
+        }
+        self.instructions.clear();
+    }
+
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.header = MessageHeader::decode_ext(reader, ctx.as_deref_mut())?;
+        self.config = V1TransactionConfig::decode_ext(reader, ctx.as_deref_mut())?;
+        self.lifetime_specifier = Hash::decode_ext(reader, ctx.as_deref_mut())?;
+        self.account_keys.decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: `CompiledInstruction` accepts the all-zero bit pattern as
+        // its empty/default state.
+        unsafe {
+            decode_zerovec_in_place(&mut self.instructions, reader, ctx)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
 // `#[repr(C, u8)]` pins the discriminant to offset 0 with u8 size. That
 // layout guarantee is what makes [`VersionedMessage::decode_into`]'s
@@ -209,7 +260,7 @@ impl V0Message {
 // discriminant) safe — without it, Rust could niche-optimise the
 // discriminant anywhere in the struct.
 //
-// The variant size difference is intentional: both variants are large
+// The variant size difference is intentional: all variants are large
 // inline types by design (zero-alloc), and values live behind the owning
 // `Transaction`'s heap allocation — never moved by value.
 #[allow(clippy::large_enum_variant)]
@@ -217,6 +268,7 @@ impl V0Message {
 pub enum VersionedMessage {
     Legacy(LegacyMessage) = 0,
     V0(V0Message) = 1,
+    V1(V1Message) = 2,
 }
 
 impl Default for VersionedMessage {
@@ -233,6 +285,7 @@ impl VersionedMessage {
         match self {
             Self::Legacy(m) => m.clear(),
             Self::V0(m) => m.clear(),
+            Self::V1(m) => m.clear(),
         }
     }
 
@@ -275,6 +328,27 @@ impl VersionedMessage {
         }
         match self {
             Self::V0(m) => {
+                m.clear();
+                m
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Forces `self` into the `V1` variant in place and returns the cleared
+    /// payload. Companion to [`Self::force_legacy_mut`].
+    pub fn force_v1_mut(&mut self) -> &mut V1Message {
+        if !matches!(self, Self::V1(_)) {
+            // SAFETY: `#[repr(C, u8)]` pins the discriminant at byte 0; an
+            // all-zero `V1Message` payload is a valid default state.
+            unsafe {
+                core::ptr::drop_in_place(self as *mut Self);
+                core::ptr::write_bytes(self as *mut Self, 0, 1);
+                *(self as *mut Self as *mut u8) = 2;
+            }
+        }
+        match self {
+            Self::V1(m) => {
                 m.clear();
                 m
             }
@@ -327,6 +401,19 @@ impl VersionedMessage {
                 }
                 match self {
                     Self::V0(m) => m.decode_into(reader, ctx),
+                    _ => unreachable!(),
+                }
+            }
+            2 => {
+                if !matches!(self, Self::V1(_)) {
+                    unsafe {
+                        core::ptr::drop_in_place(self as *mut Self);
+                        core::ptr::write_bytes(self as *mut Self, 0, 1);
+                        *(self as *mut Self as *mut u8) = 2;
+                    }
+                }
+                match self {
+                    Self::V1(m) => m.decode_into(reader, ctx),
                     _ => unreachable!(),
                 }
             }
@@ -494,6 +581,7 @@ pub struct Reward {
     pub post_balance: u64,
     pub reward_type: Option<RewardType>,
     pub commission: Option<u8>,
+    pub commission_bps: Option<u16>,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +591,7 @@ pub enum RewardType {
     Rent,
     Staking,
     Voting,
+    DeactivatedStake,
 }
 
 /// Status of a transaction after execution.
@@ -969,6 +1058,8 @@ impl ZeroAlloc for CompiledInstruction {}
 impl ZeroAlloc for MessageAddressTableLookup {}
 impl ZeroAlloc for LegacyMessage {}
 impl ZeroAlloc for V0Message {}
+impl ZeroAlloc for V1TransactionConfig {}
+impl ZeroAlloc for V1Message {}
 impl ZeroAlloc for VersionedMessage {}
 impl ZeroAlloc for InnerInstruction {}
 impl ZeroAlloc for LogMessages {}
@@ -1008,7 +1099,12 @@ const _: fn() = || {
     // `V0Message` fields (superset of LegacyMessage)
     assert_zero_alloc::<ZeroVec<MAX_TX_ADDR_LOOKUPS, MessageAddressTableLookup>>();
 
-    // `VersionedMessage` is an enum of Legacy/V0 — both already asserted.
+    // `V1Message` fields
+    assert_zero_alloc::<Option<u64>>();
+    assert_zero_alloc::<Option<u32>>();
+    assert_zero_alloc::<V1TransactionConfig>();
+
+    // `VersionedMessage` is an enum of Legacy/V0/V1 — all already asserted.
 
     // `InnerInstruction` fields
     assert_zero_alloc::<u8>(); // outer_index
@@ -1027,6 +1123,7 @@ const _: fn() = || {
     assert_zero_alloc::<i64>();
     assert_zero_alloc::<Option<RewardType>>();
     assert_zero_alloc::<Option<u8>>();
+    assert_zero_alloc::<Option<u16>>();
 
     // `TransactionStatus` fields
     assert_zero_alloc::<u16>(); // error_code
@@ -1066,6 +1163,8 @@ const _: fn() = || {
     assert_zero_alloc::<MessageAddressTableLookup>();
     assert_zero_alloc::<LegacyMessage>();
     assert_zero_alloc::<V0Message>();
+    assert_zero_alloc::<V1TransactionConfig>();
+    assert_zero_alloc::<V1Message>();
     assert_zero_alloc::<VersionedMessage>();
     assert_zero_alloc::<InnerInstruction>();
     assert_zero_alloc::<LogMessages>();
@@ -1168,8 +1267,9 @@ mod tests {
         run_big_stack(|| {
             let legacy = VersionedMessage::Legacy(LegacyMessage::default());
             let v0 = VersionedMessage::V0(V0Message::default());
+            let v1 = VersionedMessage::V1(V1Message::default());
 
-            for original in [legacy, v0] {
+            for original in [legacy, v0, v1] {
                 let mut buf = vec![0u8; 4096];
                 let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
                 let written = original.encode_ext(&mut cursor, None).unwrap();

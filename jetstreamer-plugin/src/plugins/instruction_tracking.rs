@@ -5,7 +5,6 @@ use dashmap::DashMap;
 use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use solana_message::VersionedMessage;
 use solana_sdk_ids::vote::id as vote_program_id;
 
 use crate::{Plugin, PluginFuture};
@@ -248,25 +247,12 @@ fn instruction_vote_counts(transaction: &TransactionData) -> (u64, u64) {
         }
     };
 
-    match &transaction.transaction.message {
-        VersionedMessage::Legacy(msg) => {
-            for ix in &msg.instructions {
-                classify(
-                    ix.program_id_index as usize,
-                    &mut vote_count,
-                    &mut non_vote_count,
-                );
-            }
-        }
-        VersionedMessage::V0(msg) => {
-            for ix in &msg.instructions {
-                classify(
-                    ix.program_id_index as usize,
-                    &mut vote_count,
-                    &mut non_vote_count,
-                );
-            }
-        }
+    for ix in transaction.transaction.message.instructions() {
+        classify(
+            ix.program_id_index as usize,
+            &mut vote_count,
+            &mut non_vote_count,
+        );
     }
 
     if let Some(inner_sets) = transaction

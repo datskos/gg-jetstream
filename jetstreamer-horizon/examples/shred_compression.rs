@@ -3,13 +3,10 @@
 //!
 //! A slot's shred payload is its serialized entry stream: `Vec<Entry>` where
 //! `Entry { num_hashes: u64, hash: Hash, transactions: Vec<VersionedTransaction> }`,
-//! bincode-encoded and chopped into data shreds. This example rebuilds that
+//! wincode-encoded and chopped into data shreds. This example rebuilds that
 //! stream per slot and compares three encodings:
 //!
-//! 1. `wire` — today's shred payload format (bincode, exactly as Turbine
-//!    ships it in agave 3.x; swap to wincode, which is byte-identical, once
-//!    the workspace reaches solana-transaction >= 3.1 with its `wincode`
-//!    feature — currently blocked by an agave =3.0.2 pin).
+//! 1. `wire` — today's native Agave v4 wincode payload format.
 //! 2. `lencode/tx` — lencode with the frozen 65,535-entry prime table, dedupe
 //!    scratch reset per transaction. Models SIMD-0385-style per-transaction
 //!    independent encoding (each transaction decodable alone).
@@ -45,7 +42,7 @@ use lencode::prelude::*;
 use solana_entry::entry::Entry;
 use solana_message::{
     Message as SolLegacyMessage, MessageHeader as SolMessageHeader,
-    VersionedMessage as SolVersionedMessage, compiled_instruction::CompiledInstruction, v0,
+    VersionedMessage as SolVersionedMessage, compiled_instruction::CompiledInstruction, v0, v1,
 };
 use solana_transaction::versioned::VersionedTransaction;
 use std::sync::Arc;
@@ -177,6 +174,22 @@ fn to_versioned(tx: &htx::Transaction) -> VersionedTransaction {
                 })
                 .collect(),
         }),
+        htx::VersionedMessage::V1(m) => SolVersionedMessage::V1(v1::Message {
+            header: SolMessageHeader {
+                num_required_signatures: m.header.num_required_signatures,
+                num_readonly_signed_accounts: m.header.num_readonly_signed_accounts,
+                num_readonly_unsigned_accounts: m.header.num_readonly_unsigned_accounts,
+            },
+            config: v1::TransactionConfig {
+                priority_fee: m.config.priority_fee,
+                compute_unit_limit: m.config.compute_unit_limit,
+                loaded_accounts_data_size_limit: m.config.loaded_accounts_data_size_limit,
+                heap_size: m.config.heap_size,
+            },
+            lifetime_specifier: to_sol_hash(&m.lifetime_specifier),
+            account_keys: m.account_keys.iter().map(to_pubkey).collect(),
+            instructions: m.instructions.iter().map(to_instruction).collect(),
+        }),
     };
     VersionedTransaction {
         signatures,
@@ -281,7 +294,7 @@ impl Collector {
         assert_eq!(cursor, txs.len(), "entry tx counts must cover the slot");
 
         if std::env::var_os("SHRED_NO_BINCODE").is_none() {
-            let baseline = bincode::serialize(&stream).expect("serialize entry stream");
+            let baseline = wincode::serialize(&stream).expect("serialize entry stream");
             self.wire.add_slot(baseline.len() as u64);
         }
 
@@ -361,24 +374,28 @@ impl SlotVisitor for Collector {
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, tx: &htx::Transaction) {
         if let Some((path, count, msgs)) = self.dump.as_mut() {
             let (keys, blockhash, ixs) = match &tx.message {
-                    htx::VersionedMessage::Legacy(m) => (
-                        m.account_keys.as_slice(),
-                        m.recent_blockhash,
-                        m.instructions.as_slice(),
-                    ),
-                    htx::VersionedMessage::V0(m) => (
-                        m.account_keys.as_slice(),
-                        m.recent_blockhash,
-                        m.instructions.as_slice(),
-                    ),
-                };
+                htx::VersionedMessage::Legacy(m) => (
+                    m.account_keys.as_slice(),
+                    m.recent_blockhash,
+                    m.instructions.as_slice(),
+                ),
+                htx::VersionedMessage::V0(m) => (
+                    m.account_keys.as_slice(),
+                    m.recent_blockhash,
+                    m.instructions.as_slice(),
+                ),
+                htx::VersionedMessage::V1(m) => (
+                    m.account_keys.as_slice(),
+                    m.lifetime_specifier,
+                    m.instructions.as_slice(),
+                ),
+            };
             msgs.push(DumpMsg {
                 account_keys: keys
                     .iter()
                     .map(|k| <[u8; 32]>::try_from(k.as_ref()).expect("32-byte key"))
                     .collect(),
-                recent_blockhash: <[u8; 32]>::try_from(blockhash.as_ref())
-                    .expect("32-byte hash"),
+                recent_blockhash: <[u8; 32]>::try_from(blockhash.as_ref()).expect("32-byte hash"),
                 instructions: ixs
                     .iter()
                     .map(|ix| DumpIx {
@@ -510,7 +527,7 @@ fn run() {
         "model: {DATA_SHRED_PAYLOAD} B payload/data shred, {FEC_DATA_SHREDS}+{FEC_DATA_SHREDS} \
          FEC sets, {PACKET_BYTES} B packets, entry hashes as 32-byte placeholders\n"
     );
-    print_mode("wire (bincode)", &c.wire, &c.wire, c.blocks);
+    print_mode("wire (wincode)", &c.wire, &c.wire, c.blocks);
     print_mode("lencode/tx", &c.lencode_tx, &c.wire, c.blocks);
     print_mode("lencode/slot", &c.lencode_slot, &c.wire, c.blocks);
     println!(

@@ -28,7 +28,7 @@ We envision the following applications for SVM
     The SVM is currently viewed as realizing two stages of the
     Transaction Engine Execution pipeline as described in Solana
     Architecture documentation
-    [https://docs.solana.com/validator/runtime#execution](https://docs.solana.com/validator/runtime#execution),
+    [https://docs.anza.xyz/validator/runtime#execution](https://docs.anza.xyz/validator/runtime#execution),
     namely ‘load accounts’ and ‘execute’ stages.
 
 - **SVM Rollups**
@@ -183,8 +183,8 @@ the transaction processor.
 - `account_overrides`: Encapsulates overridden accounts, typically used for
   transaction simulation.
 - `compute_budget`: The compute budget to use for transaction execution.
-- `check_program_modification_slot`: Whether or not to check a program's
-  modification slot when replenishing a program cache instance.
+- `check_program_deployment_slot`: Whether or not to check a program's
+  deployment slot when replenishing a program cache instance.
 - `log_messages_bytes_limit`: The maximum number of bytes that log messages can
   consume.
 - `limit_to_load_programs`: Whether to limit the number of programs loaded for
@@ -281,10 +281,11 @@ Steps of `load_and_execute_sanitized_transactions`
       `TransactionError`, if any of instructions failed to execute
       correctly.
    7. Verify transaction accounts' `RentState` changes (`verify_changes` function)
-      - If the account `RentState` pre-transaction processing is rent exempt or unitiliazed, the verification will pass.
+      - If the account `RentState` post-transaction processing is rent exempt or uninitialized, the verification will pass, regardless of the pre-transaction `RentState`.
       - If the account `RentState` pre-transaction is rent paying:
-         - A transition to a state uninitialized or rent exempt post-transaction is not allowed.
-         - If its size has changed or its balance has increased, it cannot remain rent paying.
+         - It may remain rent paying only if its size has not changed and its balance has not increased.
+      - If the account `RentState` pre-transaction is rent exempt or uninitialized:
+         - It cannot become rent paying.
    8. Extract log messages.
    9. Extract inner instructions (`Vec<Vec<InnerInstruction>>`).
    10. Extract `ExecutionRecord` components from transaction context.
