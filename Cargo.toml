@@ -53,7 +53,7 @@ env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
 serial_test = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 wincode = "0.5.5"
 bs58 = { version = "0", default-features = false }
 cbor = "0"
