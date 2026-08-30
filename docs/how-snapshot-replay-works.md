@@ -26,6 +26,28 @@ jetstreamer-node replay-slots \
   --no-verify
 ```
 
+## Log File
+
+Jetstreamer mirrors its timestamped console logs to this file by default:
+
+```text
+/path/to/replay-cache/jetstreamer-node.log
+```
+
+The file is opened in append mode, so logs from a later invocation do not
+erase an earlier run. The beginning of each invocation contains a `file
+logging enabled` record. Set `JETSTREAMER_LOG_FILE` to use a different path:
+
+```bash
+JETSTREAMER_LOG_FILE=/path/to/replay-441851484-441851489.log \
+  jetstreamer-node replay-slots \
+    441851484:441851489 \
+    /path/to/replay-cache \
+    --no-verify
+```
+
+The final `replay complete` summary is written to the file as well as stdout.
+
 ## 1. Parse the Requested Range
 
 `replay-slots` validates that:
@@ -118,6 +140,13 @@ CACHE_DIR/accounts-run/
 
 On later runs, extraction is skipped when its completion marker and account
 files remain present.
+
+When extraction is required, progress reports the extracted file count and
+rate without first counting every archive entry. This avoids an additional
+full decompression pass. Set `JETSTREAMER_SNAPSHOT_UNPACK_PERCENT=1` only when
+percentage progress is worth that startup cost. The legacy
+`JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT=1` setting remains accepted but is no
+longer necessary.
 
 Archive loading is implemented by `load_bank_from_snapshot_archive()`.
 

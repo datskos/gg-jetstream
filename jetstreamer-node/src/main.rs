@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Stdio, exit},
     str::FromStr,
@@ -2596,6 +2597,72 @@ struct AbortOnErrorLogger {
     restart_tracker: Arc<RestartTracker>,
 }
 
+static LOG_FILE_SINK: std::sync::LazyLock<Mutex<Option<fs::File>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// `env_logger` output target that preserves the existing stderr stream and
+/// mirrors every formatted record to the configured session log.
+struct TeeLogWriter;
+
+impl Write for TeeLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        io::stderr().write_all(buffer)?;
+        let mut sink = LOG_FILE_SINK
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?;
+        if let Some(file) = sink.as_mut() {
+            file.write_all(buffer)?;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()?;
+        let mut sink = LOG_FILE_SINK
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?;
+        if let Some(file) = sink.as_mut() {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn enable_file_logging(default_dir: &Path) -> Result<PathBuf, String> {
+    let path = env::var_os("JETSTREAMER_LOG_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_dir.join("jetstreamer-node.log"));
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create log directory {}: {err}", parent.display()))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("failed to open log file {}: {err}", path.display()))?;
+    *LOG_FILE_SINK
+        .lock()
+        .map_err(|_| "log file lock poisoned".to_string())? = Some(file);
+    info!(
+        "file logging enabled: {} (append mode; override with JETSTREAMER_LOG_FILE)",
+        path.display()
+    );
+    Ok(path)
+}
+
+fn append_raw_log_line(line: &str) {
+    if let Ok(mut sink) = LOG_FILE_SINK.lock()
+        && let Some(file) = sink.as_mut()
+    {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
 impl log::Log for AbortOnErrorLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         if metadata.level() == log::Level::Error {
@@ -2678,7 +2745,9 @@ impl log::Log for AbortOnErrorLogger {
         }
     }
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        self.inner.flush();
+    }
 }
 
 fn setup_logger(
@@ -2693,10 +2762,12 @@ fn setup_logger(
         }
         Err(_) => true,
     };
-    let logger =
-        env_logger::Builder::from_env(env_logger::Env::new().default_filter_or(DEFAULT_LOG_FILTER))
-            .format_timestamp_nanos()
-            .build();
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::new().default_filter_or(DEFAULT_LOG_FILTER));
+    builder
+        .format_timestamp_nanos()
+        .target(env_logger::Target::Pipe(Box::new(TeeLogWriter)));
+    let logger = builder.build();
     let max_level = logger.filter();
     let install = log::set_boxed_logger(Box::new(AbortOnErrorLogger {
         inner: logger,
@@ -5394,7 +5465,12 @@ fn load_bank_from_snapshot_archive(
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs)
             .or_else(|| Some(Duration::from_secs(SNAPSHOT_UNPACK_LOG_INTERVAL_SECS)));
-        let percent_enabled = !env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT");
+        // Counting requires a complete decompression pass before the real
+        // extraction (over two minutes for the 112 GiB mainnet snapshot used
+        // during replay testing), so rate/file-count progress is the default.
+        // Keep the old negative switch as a compatibility override.
+        let percent_enabled = env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_PERCENT")
+            && !env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT");
         let total_entries = if percent_enabled {
             info!(
                 "counting snapshot archive entries for progress percent ({})",
@@ -5415,6 +5491,9 @@ fn load_bank_from_snapshot_archive(
                 }
             }
         } else {
+            info!(
+                "snapshot archive entry pre-count disabled (default; set JETSTREAMER_SNAPSHOT_UNPACK_PERCENT=1 to enable percentages)"
+            );
             None
         };
         if let Some(interval) = log_interval {
@@ -7733,7 +7812,7 @@ async fn run_slot_replay_command(
     let warmup_transactions = result
         .replayed_transactions
         .saturating_sub(result.target_transactions);
-    println!(
+    let completion = format!(
         "replay complete: requested={}..={} snapshot_slot={} replay_start={} \
          warmup_txs={} range_txs={} final_bank_slot={} final_bank_hash={}",
         range.start,
@@ -7745,6 +7824,8 @@ async fn run_slot_replay_command(
         final_bank.slot(),
         final_bank.hash(),
     );
+    println!("{completion}");
+    append_raw_log_line(&completion);
     Ok(())
 }
 
@@ -7828,6 +7909,10 @@ async fn main() {
                 }
             },
         };
+        if let Err(err) = enable_file_logging(&cache_dir) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
         if let Err(err) = run_slot_replay_command(
             range,
             &cache_dir,
@@ -7901,6 +7986,10 @@ async fn main() {
             }
         },
     };
+    if let Err(err) = enable_file_logging(&dest_dir) {
+        eprintln!("error: {err}");
+        exit(1);
+    }
 
     if horizon_output.is_some() && start_epoch != end_epoch {
         eprintln!(
