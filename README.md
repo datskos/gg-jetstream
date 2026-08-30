@@ -55,6 +55,101 @@ Jetstreamer Runner with the Program Tracking plugin enabled. The built-in plugin
 `--no-plugins` to disable the default. Run `--list-plugins` to print the names of every bundled
 plugin and exit.
 
+### Snapshot-backed transaction replay (`jetstreamer-node`)
+
+`jetstreamer-node replay-slots` restores a Solana Bank from a full snapshot, downloads the
+incremental slot data from Old Faithful, and executes the requested transactions against that
+state. This is separate from the firehose-only Runner CLI documented below.
+
+#### Required open-file limit
+
+A mainnet snapshot can contain hundreds of thousands of AccountsDB files. The usual soft limit
+of 1,024 file descriptors is too low and causes snapshot restoration to fail with `Too many open
+files (os error 24)` or a secondary snapshot-storage-rebuilder panic.
+
+In the same shell that will launch `jetstreamer-node`, confirm that the hard limit is at least
+524,288, raise the soft limit, and verify it:
+
+```bash
+ulimit -Hn
+ulimit -S -n 524288
+ulimit -Sn
+```
+
+The last command must print `524288`. `ulimit` affects only the current shell and processes
+started from it, so opening another terminal or running the binary from a service does not reuse
+this setting. For a systemd service, configure `LimitNOFILE=524288` in the service unit instead.
+If the hard limit is below 524,288 or the shell reports `Operation not permitted`, raise the
+login/service hard limit first and start a new shell; running only the binary with `sudo` does not
+reliably preserve the caller's limit.
+
+#### Prepare the replay cache
+
+Build the node explicitly:
+
+```bash
+cargo build --release -p jetstreamer-node
+```
+
+The replay cache must contain a compatible mainnet genesis and a full snapshot from before the
+first requested slot. Keep the snapshot archive directly in the cache directory, not in its
+`snapshots/` subdirectory:
+
+```text
+/home/ubuntu/jetstreamer_replay_scratch/
+|-- genesis.bin
+`-- snapshot-441851483-<hash>.tar.zst
+```
+
+`genesis.tar.bz2` can be used instead of `genesis.bin`. The genesis and snapshot must be compatible
+with the Agave version used to build `jetstreamer-node`.
+
+#### Run replay
+
+This example replays 1,000 inclusive slots using the binary installed under
+`/home/ubuntu/gg-jetstream`:
+
+```bash
+ulimit -S -n 524288
+
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false \
+  /home/ubuntu/gg-jetstream/jetstreamer-node \
+    replay-slots 441851484:441852483 \
+    /home/ubuntu/jetstreamer_replay_scratch \
+    --no-verify
+```
+
+`JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false` disables automatic removal of mutable AccountsDB
+paths at startup. The top-level snapshot archive is not one of those paths, but disabling cleanup
+is the conservative choice when preserving a prepared remote replay cache.
+
+`--no-verify` avoids the GCS checkpoint lookup and therefore works without Google Cloud
+credentials when the snapshot and genesis have already been staged locally. It skips comparison
+with canonical snapshot checkpoint hashes, but transaction execution results are still compared
+with their historical expected statuses. Use `--verify` only when `gcloud` is installed and can
+list the configured snapshot bucket.
+
+A successful run prints a summary resembling:
+
+```text
+replay complete: requested=441851484..=441852483 ... final_bank_slot=441852483 final_bank_hash=...
+```
+
+Console logs are also appended automatically to:
+
+```text
+/home/ubuntu/jetstreamer_replay_scratch/jetstreamer-node.log
+```
+
+Follow them from another shell with:
+
+```bash
+tail -f /home/ubuntu/jetstreamer_replay_scratch/jetstreamer-node.log
+```
+
+See [How Snapshot Replay Works](docs/how-snapshot-replay-works.md) for the cache layout, cleanup
+scope, verification behavior, and replay pipeline in detail.
+
 ### Jetstreamer Runner CLI
 
 ```bash
