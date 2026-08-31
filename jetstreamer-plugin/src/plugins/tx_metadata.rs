@@ -112,6 +112,18 @@ pub(crate) struct InstructionView<'a> {
     pub(crate) data: &'a [u8],
 }
 
+/// Decodes the `u32` payload of a Compute Budget instruction while matching
+/// Solana's unchecked deserialization semantics: bytes after the encoded
+/// value are allowed and ignored.
+fn decode_compute_budget_u32(data: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(data.get(1..5)?.try_into().ok()?))
+}
+
+/// `u64` counterpart to [`decode_compute_budget_u32`].
+fn decode_compute_budget_u64(data: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(data.get(1..9)?.try_into().ok()?))
+}
+
 /// Scalar transaction fields plus the borrowed account view needed by the
 /// shared firehose/horizon parser.
 pub(crate) struct TxMetadataInput<'a> {
@@ -202,12 +214,12 @@ where
         }
 
         if v1_config.is_none() && program == &solana_sdk_ids::compute_budget::id() {
-            match ix.data {
-                [2, a, b, c, d] => {
-                    cu_limit = Some(u32::from_le_bytes([*a, *b, *c, *d]) as u64);
+            match ix.data.first().copied() {
+                Some(2) => {
+                    cu_limit = decode_compute_budget_u32(ix.data).map(u64::from);
                 }
-                [3, a, b, c, d, e, f, g, h] => {
-                    cu_price = Some(u64::from_le_bytes([*a, *b, *c, *d, *e, *f, *g, *h]));
+                Some(3) => {
+                    cu_price = decode_compute_budget_u64(ix.data);
                 }
                 _ => {}
             }
@@ -567,6 +579,50 @@ mod tests {
         assert!(row.is_success);
         assert_eq!(row.num_ixs, 4);
         assert_eq!(row.num_ixs_builtin, 3);
+    }
+
+    #[test]
+    fn accepts_trailing_compute_budget_instruction_bytes() {
+        let keys = [
+            Address::new_from_array([1; 32]),
+            solana_sdk_ids::compute_budget::id(),
+        ];
+        let mut cu_limit = vec![2];
+        cu_limit.extend_from_slice(&300_u32.to_le_bytes());
+        // The mainnet transaction that motivated this regression carries a
+        // 64-byte suffix. Solana's unchecked decoder ignores that suffix.
+        cu_limit.extend_from_slice(&[0xa5; 64]);
+        let cu_price = [3, 42, 212, 213, 24, 0, 0, 0, 0]; // 416_666_666
+
+        let row = parse_tx_metadata(
+            TxMetadataInput {
+                slot: 441_851_484,
+                tx_idx: 4,
+                num_signatures: 1,
+                header: MessageHeaderView {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                is_legacy: true,
+                v1_config: None,
+                fee: 130_000,
+                compute_units_consumed: Some(300),
+                is_success: true,
+                accounts: ResolvedAccounts::new(&keys, &[], &[]),
+            },
+            [ix(1, &cu_limit), ix(1, &cu_price)],
+        );
+
+        assert_eq!(row.cu, 300);
+        assert_eq!(row.cu_limit, Some(300));
+        assert_eq!(row.cu_price, Some(416_666_666));
+        assert_eq!(row.prio_fee, 125_000);
+        assert_eq!(row.txn_fee, 130_000);
+        assert_eq!(row.scheduler_cost_units, Some(17_723));
+        assert_eq!(row.scheduler_priority, Some(7_193_635));
+        assert_eq!(row.num_ixs, 2);
+        assert_eq!(row.num_ixs_builtin, 2);
     }
 
     #[test]

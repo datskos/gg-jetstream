@@ -5,7 +5,10 @@
 //! compute-budget instructions are decoded locally. Account-allocation cost is
 //! tracked separately by Agave but is not included in `TransactionCost::sum()`.
 
-use super::{InstructionView, MessageHeaderView, ResolvedAccounts, V1TransactionConfigView};
+use super::{
+    InstructionView, MessageHeaderView, ResolvedAccounts, V1TransactionConfigView,
+    decode_compute_budget_u32, decode_compute_budget_u64,
+};
 
 const BASE_FEE_BURN_PERCENT: u64 = 50;
 const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
@@ -197,12 +200,21 @@ where
         let program_id = accounts.get(usize::from(ix.program_id_index))?;
         if program_id == &solana_sdk_ids::compute_budget::ID {
             match ix.data.first().copied()? {
-                1 => set_once(&mut requested_heap_size, read_u32(ix.data)?)?,
-                2 => set_once(&mut requested_compute_unit_limit, read_u32(ix.data)?)?,
-                3 => set_once(&mut requested_compute_unit_price, read_u64(ix.data)?)?,
+                1 => set_once(
+                    &mut requested_heap_size,
+                    decode_compute_budget_u32(ix.data)?,
+                )?,
+                2 => set_once(
+                    &mut requested_compute_unit_limit,
+                    decode_compute_budget_u32(ix.data)?,
+                )?,
+                3 => set_once(
+                    &mut requested_compute_unit_price,
+                    decode_compute_budget_u64(ix.data)?,
+                )?,
                 4 => set_once(
                     &mut requested_loaded_accounts_data_size_limit,
-                    read_u32(ix.data)?,
+                    decode_compute_budget_u32(ix.data)?,
                 )?,
                 _ => return None,
             }
@@ -289,14 +301,6 @@ fn set_once<T>(target: &mut Option<T>, value: T) -> Option<()> {
     }
     *target = Some(value);
     Some(())
-}
-
-fn read_u32(data: &[u8]) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(1..5)?.try_into().ok()?))
-}
-
-fn read_u64(data: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(1..9)?.try_into().ok()?))
 }
 
 fn is_agave_4_2_builtin(program_id: &solana_address::Address) -> bool {
