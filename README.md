@@ -219,6 +219,14 @@ With the default DSN (`http://localhost:8123`), the pipeline starts and supervis
 ClickHouse server. Do not use this mode while another ClickHouse server already owns the local
 data directory or port.
 
+> **ClickHouse safety:** Treat every ClickHouse instance, including one reached through
+> `localhost`, as persistent production data. A local endpoint or data directory may later be
+> mounted into, or moved to, a server. Do not automatically `DROP` or `TRUNCATE` tables, run
+> `ALTER TABLE ... DELETE`, remove ClickHouse data directories, or delete its `access/`,
+> `metadata/`, `store/`, `data/`, or `uuid` files. A hostname that looks local is not permission
+> to destroy its data. Any destructive maintenance must be a separate, explicit operator action
+> with the exact server, database, tables, slot range, and recovery plan reviewed first.
+
 To write to an already-running ClickHouse server, first verify its HTTP endpoint, then pass an
 external DSN. The current pipeline treats the literal hosts `localhost` and `127.0.0.1` as a
 request to start the bundled server. On Linux, `127.1` reaches the same loopback interface while
@@ -252,23 +260,10 @@ raw ClickHouse row for every account update contained in the `.jet` archive.
 
 After a clean, single import, ordinary queries do not need `FINAL`. The tables use
 `ReplacingMergeTree`, so importing the same slots again can expose duplicate physical rows until
-ClickHouse merges them. For a deterministic refresh, delete only the affected range from the
-three slot-keyed output tables before importing it again:
-
-```sql
-ALTER TABLE tx_meta_v2
-  DELETE WHERE slot BETWEEN 441851484 AND 441852483
-  SETTINGS mutations_sync = 2;
-ALTER TABLE pubkey_mentions
-  DELETE WHERE slot BETWEEN 441851484 AND 441852483
-  SETTINGS mutations_sync = 2;
-ALTER TABLE account_write_stats
-  DELETE WHERE slot BETWEEN 441851484 AND 441852483
-  SETTINGS mutations_sync = 2;
-```
-
-Do not drop shared tables merely to refresh one archive. Use `FINAL` only when a query must hide
-transient duplicates from repeated imports that have not yet merged.
+ClickHouse merges them. Do not delete existing rows or tables as part of an import or retry. Use
+`FINAL` when a query must hide transient duplicates from repeated imports that have not yet
+merged. If an isolated rebuild is required, write it to a separately provisioned database or
+server and validate it before an operator deliberately changes production ownership or routing.
 
 See [How Snapshot Replay Works](docs/how-snapshot-replay-works.md) for the cache layout, cleanup
 scope, verification behavior, and replay pipeline in detail.
