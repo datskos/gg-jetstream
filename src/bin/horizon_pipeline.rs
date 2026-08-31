@@ -26,6 +26,7 @@ use jetstreamer_plugin::horizon::{
 };
 use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
+use jetstreamer_plugin::plugins::transactions_raw_horizon::TransactionsRawHorizonPlugin;
 use jetstreamer_plugin::plugins::tx_metadata_horizon::TxMetadataHorizonPlugin;
 
 // jemalloc, for the same reason as jetstreamer-node: the decode path churns
@@ -346,6 +347,7 @@ async fn main() {
             Arc::new(PubkeyStatsHorizonPlugin::new()),
             Arc::new(AccountWritesPlugin::new()),
             Arc::new(TxMetadataHorizonPlugin::new()),
+            Arc::new(TransactionsRawHorizonPlugin::new()),
         ]
     };
 

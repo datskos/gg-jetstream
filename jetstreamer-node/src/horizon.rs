@@ -38,7 +38,7 @@
 //! the node's replay machinery already treats divergence as fatal.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
 use std::path::Path;
 use std::str::FromStr;
@@ -100,6 +100,15 @@ pub fn archive_bytes_written() -> u64 {
     ARCHIVE_BYTES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Controls whether opening an archive may replace an existing file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFileMode {
+    /// Preserve the existing epoch writer behavior and truncate the path.
+    Truncate,
+    /// Atomically refuse to open the archive when the path already exists.
+    CreateNew,
+}
+
 /// Installs the active recorder for one epoch's archive. Call before that
 /// epoch's replay starts; pair with [`finish`] when it ends. Errors if a
 /// recorder is still installed (the previous epoch must be finished first).
@@ -109,8 +118,11 @@ pub fn init(
     slot_start: Slot,
     slot_count: u64,
     presence: Arc<SlotPresenceMap>,
+    file_mode: ArchiveFileMode,
 ) -> Result<(), String> {
-    let recorder = HorizonRecorder::create(path, epoch, slot_start, slot_count, presence)?;
+    let recorder = HorizonRecorder::create_with_mode(
+        path, epoch, slot_start, slot_count, presence, file_mode,
+    )?;
     let mut slot = RECORDER
         .write()
         .map_err(|_| "horizon recorder lock poisoned".to_string())?;
@@ -322,15 +334,32 @@ pub struct HorizonRecorder {
 impl HorizonRecorder {
     /// Opens the archive file and builds a recorder for `slot_start ..
     /// slot_start + slot_count`.
-    fn create(
+    fn create_with_mode(
         path: &Path,
         epoch: u64,
         slot_start: Slot,
         slot_count: u64,
         presence: std::sync::Arc<SlotPresenceMap>,
+        file_mode: ArchiveFileMode,
     ) -> Result<Self, String> {
-        let file = File::create(path)
-            .map_err(|err| format!("failed to create horizon archive {}: {err}", path.display()))?;
+        let file = match file_mode {
+            ArchiveFileMode::Truncate => File::create(path),
+            ArchiveFileMode::CreateNew => {
+                OpenOptions::new().write(true).create_new(true).open(path)
+            }
+        }
+        .map_err(|err| {
+            if file_mode == ArchiveFileMode::CreateNew
+                && err.kind() == std::io::ErrorKind::AlreadyExists
+            {
+                format!(
+                    "refusing to overwrite existing horizon archive {}",
+                    path.display()
+                )
+            } else {
+                format!("failed to create horizon archive {}: {err}", path.display())
+            }
+        })?;
         let writer = ArchiveWriter::new(
             BufWriter::with_capacity(8 << 20, file),
             epoch,
@@ -936,6 +965,31 @@ mod tests {
             .expect("join test thread");
     }
 
+    #[test]
+    fn create_new_preserves_existing_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing.jet");
+        let original = b"existing archive bytes";
+        std::fs::write(&path, original).expect("write existing archive");
+        let presence = presence_map(100, &[SlotPresenceState::Missing]);
+
+        let result = HorizonRecorder::create_with_mode(
+            &path,
+            42,
+            100,
+            1,
+            presence,
+            ArchiveFileMode::CreateNew,
+        );
+        let err = match result {
+            Ok(_) => panic!("create-new unexpectedly replaced an existing archive"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("refusing to overwrite existing horizon archive"));
+        assert_eq!(std::fs::read(&path).expect("read archive"), original);
+    }
+
     fn recorder_end_to_end_body() {
         // Slots 100..=109: blocks at 100 and 105, everything else
         // leader-skipped.
@@ -946,8 +1000,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 42, 100, 10, presence).expect("create recorder");
+        let recorder = HorizonRecorder::create_with_mode(
+            &path,
+            42,
+            100,
+            10,
+            presence,
+            ArchiveFileMode::Truncate,
+        )
+        .expect("create recorder");
 
         let bh_100 = solana_hash::Hash::new_unique();
         let bh_105 = solana_hash::Hash::new_unique();
@@ -1078,8 +1139,15 @@ mod tests {
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bad.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
+        let recorder = HorizonRecorder::create_with_mode(
+            &path,
+            1,
+            200,
+            3,
+            presence,
+            ArchiveFileMode::Truncate,
+        )
+        .expect("create recorder");
         // Only slot 202 gets data; 200-201 are gaps the index says exist.
         recorder.record_block_meta(
             202,
@@ -1107,8 +1175,15 @@ mod tests {
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("forced.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
+        let recorder = HorizonRecorder::create_with_mode(
+            &path,
+            1,
+            200,
+            3,
+            presence,
+            ArchiveFileMode::Truncate,
+        )
+        .expect("create recorder");
         // 200-201 have no fetchable block (their blocks don't exist despite the
         // index); the replay force-skipped them.
         {

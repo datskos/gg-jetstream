@@ -23,8 +23,26 @@ incremental transactions from Old Faithful.
 jetstreamer-node replay-slots \
   441851484:441851493 \
   /path/to/replay-cache \
-  --no-verify
+  --no-verify \
+  --horizon-output=/path/to/replay-441851484-441851493.jet
 ```
+
+`--horizon-output` is optional. When present, it records exactly the requested
+range as a compressed Horizon `.jet` archive. Existing files are never
+overwritten; an interrupted run can leave an incomplete archive without a
+valid footer, which must be moved or removed explicitly before that path is
+reused.
+
+The archive contains incremental replay events rather than the initial state:
+
+- block, entry, epoch, reward, and skipped-slot metadata;
+- full transactions and historical status metadata;
+- transaction-owned and runtime-direct account updates in application order;
+- a bucket index, checksums, account-data deltas, and zstd compression.
+
+Reconstructing complete state from the `.jet` therefore also requires the
+starting snapshot, or equivalent account state, immediately before the
+recorded range.
 
 ## Log File
 
@@ -55,6 +73,8 @@ The final `replay complete` summary is written to the file as well as stdout.
 - `START <= END`
 - `START > 0`
 - The requested range stays within one epoch
+- `--horizon-output`, when supplied, is nonempty, unique, and does not already
+  exist
 
 The command is handled in `jetstreamer-node/src/main.rs` by the
 `replay-slots` branch in `main()`.
@@ -317,6 +337,8 @@ The snapshot archive and extraction cache can survive, but:
 - The final Bank is not written as a new reusable snapshot.
 - Account changes may exist in AccountsDB run files, but those files are not a
   formal replay checkpoint.
+- An explicitly requested Horizon `.jet` archive survives as an incremental
+  event stream for the range, not as standalone account state.
 - `replay-slots` is currently a one-shot process, not a persistent replay
   service.
 

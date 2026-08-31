@@ -4524,6 +4524,13 @@ struct SlotReplayRange {
     epoch: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SlotReplayOptions {
+    cache_dir: Option<PathBuf>,
+    verify_snapshots: bool,
+    horizon_output: Option<PathBuf>,
+}
+
 /// Parses the slot replay form accepted by `replay-slots`: an inclusive
 /// `START:END` range contained by one target epoch.
 fn parse_slot_replay_range(arg: &str) -> Result<SlotReplayRange, String> {
@@ -4561,17 +4568,55 @@ fn parse_slot_replay_range(arg: &str) -> Result<SlotReplayRange, String> {
     })
 }
 
+fn parse_slot_replay_options<I>(
+    args: I,
+    verify_snapshots: bool,
+) -> Result<SlotReplayOptions, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = SlotReplayOptions {
+        cache_dir: None,
+        verify_snapshots,
+        horizon_output: None,
+    };
+    for arg in args {
+        if arg == "--verify" {
+            options.verify_snapshots = true;
+        } else if arg == "--no-verify" {
+            options.verify_snapshots = false;
+        } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
+            if path.is_empty() {
+                return Err("--horizon-output requires a nonempty path".to_string());
+            }
+            if options.horizon_output.is_some() {
+                return Err("--horizon-output may only be specified once".to_string());
+            }
+            options.horizon_output = Some(PathBuf::from(path));
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown replay-slots option '{arg}'"));
+        } else if options.cache_dir.is_none() {
+            options.cache_dir = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unexpected replay-slots argument '{arg}'"));
+        }
+    }
+    Ok(options)
+}
+
 fn usage(program: &str) -> String {
     format!(
         "Usage:\n\
          {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
-         {program} replay-slots START:END [cache-dir] [--verify|--no-verify]\n\
+         {program} replay-slots START:END [cache-dir] [--verify|--no-verify] \
+         [--horizon-output=PATH]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
          replay-slots accepts an inclusive, single-epoch slot range. It automatically\n\
          downloads or reuses the newest snapshot before START, warms the Bank forward,\n\
-         and replays through END without writing a horizon archive.\n\
+         and replays through END. Pass --horizon-output=PATH to record exactly\n\
+         START..=END to a new horizon archive; existing files are never overwritten.\n\
          A range pre-downloads every epoch's boundary snapshot and snapshot hashes\n\
          up front (the only gcloud/GCS access), then runs each epoch in its own\n\
          child process so replay memory is fully released at every epoch boundary.\n\
@@ -4580,7 +4625,7 @@ fn usage(program: &str) -> String {
          JETSTREAMER_EPOCH_ATTEMPTS (default 2) bounds retries of a crashed epoch;\n\
          JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS=0 keeps each boundary snapshot archive\n\
          after its epoch finalizes (default: deleted to reclaim disk).\n\
-         --horizon-output applies only to a single epoch.\n\
+         --horizon-output applies to a single epoch or one replay-slots range.\n\
          --epoch-hashes=PATH and --range-info=A-B are internal flags passed by the\n\
          range supervisor to its per-epoch children."
     )
@@ -6149,6 +6194,7 @@ struct ReplayWindow {
     target_start: Slot,
     end_inclusive: Slot,
     horizon_output: Option<PathBuf>,
+    horizon_file_mode: horizon::ArchiveFileMode,
     use_dir_loader: bool,
 }
 
@@ -6191,6 +6237,7 @@ async fn run_geyser_replay(
         target_start,
         end_inclusive,
         horizon_output,
+        horizon_file_mode,
         use_dir_loader,
     } = window;
     let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(target_start)));
@@ -6303,6 +6350,7 @@ async fn run_geyser_replay(
             target_start,
             end_inclusive - target_start + 1,
             slot_presence.clone(),
+            horizon_file_mode,
         )?;
         info!(
             "horizon archive recording to {} (epoch {}, slots {}..={})",
@@ -7676,10 +7724,39 @@ async fn run_epoch_range_supervisor(
     Ok(())
 }
 
+fn ensure_horizon_output_absent(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "refusing to overwrite existing horizon archive {}",
+            path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to inspect horizon output {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn prepare_horizon_output(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create horizon output directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    ensure_horizon_output_absent(path)
+}
+
 async fn run_slot_replay_command(
     range: SlotReplayRange,
     cache_dir: &Path,
     verify_snapshots: bool,
+    horizon_output: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
@@ -7691,6 +7768,13 @@ async fn run_slot_replay_command(
         )
     })?;
 
+    // Refuse before cleanup so an output accidentally placed under a mutable
+    // cache path cannot be removed before we notice it. The atomic create-new
+    // open in the recorder closes the remaining race at recording time.
+    if let Some(path) = horizon_output.as_ref() {
+        ensure_horizon_output_absent(path)?;
+    }
+
     // Replay mutates its live AccountsDB paths. Preserve downloaded archives
     // and pristine archive extractions, but rebuild all mutable state before
     // every range run just like the existing epoch path does.
@@ -7698,6 +7782,9 @@ async fn run_slot_replay_command(
         clear_ledger_accounts_state(cache_dir)?;
     } else {
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
+    }
+    if let Some(path) = horizon_output.as_ref() {
+        prepare_horizon_output(path)?;
     }
 
     let target_snapshot_slot = range.start - 1;
@@ -7784,7 +7871,8 @@ async fn run_slot_replay_command(
         ReplayWindow {
             target_start: range.start,
             end_inclusive: range.end_inclusive,
-            horizon_output: None,
+            horizon_output,
+            horizon_file_mode: horizon::ArchiveFileMode::CreateNew,
             // replay-slots always consumes the explicitly selected archive;
             // a global dir-loader toggle must not silently bypass it.
             use_dir_loader: false,
@@ -7880,25 +7968,22 @@ async fn main() {
                 exit(2);
             }
         };
-        let mut cache_dir_arg = None;
-        let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
-        for arg in args {
-            if arg == "--verify" {
-                verify_snapshots = true;
-            } else if arg == "--no-verify" {
-                verify_snapshots = false;
-            } else if arg.starts_with('-') {
-                eprintln!("unknown replay-slots option '{arg}'");
-                eprintln!("{}", usage(&program));
-                exit(2);
-            } else if cache_dir_arg.is_none() {
-                cache_dir_arg = Some(PathBuf::from(arg));
-            } else {
-                eprintln!("unexpected replay-slots argument '{arg}'");
+        let options = match parse_slot_replay_options(
+            args,
+            env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true),
+        ) {
+            Ok(options) => options,
+            Err(err) => {
+                eprintln!("{err}");
                 eprintln!("{}", usage(&program));
                 exit(2);
             }
-        }
+        };
+        let SlotReplayOptions {
+            cache_dir: cache_dir_arg,
+            verify_snapshots,
+            horizon_output,
+        } = options;
         let cache_dir = match cache_dir_arg {
             Some(path) => path,
             None => match env::current_dir() {
@@ -7917,6 +8002,7 @@ async fn main() {
             range,
             &cache_dir,
             verify_snapshots,
+            horizon_output,
             shutdown,
             cursor,
             restart_tracker,
@@ -8348,6 +8434,7 @@ async fn main() {
                 target_start,
                 end_inclusive: target_end_inclusive,
                 horizon_output: Some(horizon_output),
+                horizon_file_mode: horizon::ArchiveFileMode::Truncate,
                 use_dir_loader: env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
             },
             &dest_dir,
@@ -8376,7 +8463,8 @@ mod scheduler_tests {
     use super::{
         BANK_SNAPSHOTS_DIR, EntryAccounts, ReadyEntry, ReadyQueueMessage,
         SNAPSHOT_STATUS_CACHE_FILE, SNAPSHOT_VERSION_FILE, SlotReplayRange, assign_rounds,
-        create_disposable_bank_snapshot, parse_slot_replay_range, receive_ready_batch,
+        create_disposable_bank_snapshot, parse_slot_replay_options, parse_slot_replay_range,
+        receive_ready_batch,
     };
     use solana_address::Address;
     use solana_hash::Hash;
@@ -8412,6 +8500,42 @@ mod scheduler_tests {
         assert!(parse_slot_replay_range("0:1").is_err());
         assert!(parse_slot_replay_range("10:9").is_err());
         assert!(parse_slot_replay_range("431999:432000").is_err());
+    }
+
+    #[test]
+    fn parses_slot_replay_horizon_output() {
+        let options = parse_slot_replay_options(
+            [
+                "/tmp/replay-cache",
+                "--no-verify",
+                "--horizon-output=/tmp/range.jet",
+            ]
+            .into_iter()
+            .map(str::to_string),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(options.cache_dir, Some("/tmp/replay-cache".into()));
+        assert!(!options.verify_snapshots);
+        assert_eq!(options.horizon_output, Some("/tmp/range.jet".into()));
+    }
+
+    #[test]
+    fn rejects_invalid_slot_replay_horizon_output_options() {
+        let parse = |args: &[&str]| {
+            parse_slot_replay_options(args.iter().map(|arg| (*arg).to_string()), true)
+        };
+
+        assert!(parse(&["--horizon-output="]).is_err());
+        assert!(parse(&["--horizon-output"]).is_err());
+        assert!(
+            parse(&[
+                "--horizon-output=/tmp/one.jet",
+                "--horizon-output=/tmp/two.jet",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

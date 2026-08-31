@@ -241,6 +241,7 @@ default Horizon plugins create these ClickHouse objects if they do not already e
 | Object | Contents |
 | --- | --- |
 | `tx_meta_v2` | One execution-metadata row per transaction, keyed by `(slot, tx_idx)` |
+| `transactions_raw_v1` | One complete lencode transaction record per transaction, plus searchable signature, status, fee, and requested/consumed compute units |
 | `pubkey_mentions` | Per-slot transaction-message account-key mention counts |
 | `pubkeys` | Deduplicated pubkey-to-`sipHash64` ID mapping |
 | `pubkeys_mv` | Materialized view that populates `pubkeys` from `pubkey_mentions` |
