@@ -129,6 +129,31 @@ with canonical snapshot checkpoint hashes, but transaction execution results are
 with their historical expected statuses. Use `--verify` only when `gcloud` is installed and can
 list the configured snapshot bucket.
 
+#### Write a Horizon `.jet` archive
+
+To record a requested slot range as a compressed Horizon `.jet` archive, add an explicit output
+path to `replay-slots`:
+
+```bash
+ulimit -S -n 524288
+
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false \
+  /home/ubuntu/gg-jetstream/jetstreamer-node \
+    replay-slots 441851484:441852483 \
+    /home/ubuntu/jetstreamer_replay_scratch \
+    --no-verify \
+    --horizon-output=/home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441852483.jet
+```
+
+The archive contains only incremental data for `START..=END`: block and entry metadata, full
+transactions and statuses, skipped-slot markers, rewards, and account updates in application
+order. It does not contain the starting snapshot state, so reconstructing complete state still
+requires the snapshot (or an equivalent state store) at `START - 1`.
+
+Jetstreamer refuses to overwrite an existing path. A replay interrupted after archive creation
+can leave an incomplete file without a valid footer; preserve it for diagnosis or move/remove it
+explicitly before reusing that output name.
+
 A successful run prints a summary resembling:
 
 ```text
@@ -146,6 +171,103 @@ Follow them from another shell with:
 ```bash
 tail -f /home/ubuntu/jetstreamer_replay_scratch/jetstreamer-node.log
 ```
+
+For a full epoch, pass the epoch and destination directory instead. This form automatically uses
+the importer-compatible filename `epoch-<EPOCH>.jet`:
+
+```bash
+/home/ubuntu/gg-jetstream/jetstreamer-node \
+  1022 /data/jets --no-verify
+# Output: /data/jets/epoch-1022.jet
+```
+
+Before moving or importing an archive, verify that its footer, bucket checksums, decoded tallies,
+and blockhash chain are internally consistent:
+
+```bash
+cargo run --release -p jetstreamer-horizon --example verify_archive -- \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441852483.jet
+```
+
+The first line includes the archive header's `epoch`, `slot_start`, and `slot_count`. Use that
+header epoch when importing; a ten-slot archive is still associated with its containing epoch.
+
+#### Load a `.jet` archive into ClickHouse
+
+`horizon_pipeline` reads local archives from `<JET_DIR>/epoch-<EPOCH>.jet`. A full-epoch archive
+already has that name. For a partial archive, create a separate staging directory and link it
+under the expected name. For example, the range above belongs to epoch 1022:
+
+```bash
+mkdir -p /data/jets-partial-1022
+ln -s \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441852483.jet \
+  /data/jets-partial-1022/epoch-1022.jet
+```
+
+The first positional argument below is the archive's epoch, not the number of slots in the file.
+Although the progress log prints the epoch's full slot range, a partial archive emits only its
+stored slots:
+
+```bash
+cargo run --release --bin horizon_pipeline -- \
+  1022 /data/jets-partial-1022 \
+  --threads 16
+```
+
+With the default DSN (`http://localhost:8123`), the pipeline starts and supervises its bundled
+ClickHouse server. Do not use this mode while another ClickHouse server already owns the local
+data directory or port.
+
+To write to an already-running ClickHouse server, first verify its HTTP endpoint, then pass an
+external DSN. The current pipeline treats the literal hosts `localhost` and `127.0.0.1` as a
+request to start the bundled server. On Linux, `127.1` reaches the same loopback interface while
+selecting external-server mode:
+
+```bash
+curl --fail --show-error http://127.1:8123/ping
+
+env NO_PROXY=127.1,127.0.0.1,localhost \
+    no_proxy=127.1,127.0.0.1,localhost \
+  cargo run --release --bin horizon_pipeline -- \
+    1022 /data/jets-partial-1022 \
+    --threads 16 \
+    --clickhouse-dsn http://127.1:8123
+```
+
+For a remote server, replace `127.1` with a hostname or IP on which ClickHouse is listening. The
+default Horizon plugins create these ClickHouse objects if they do not already exist:
+
+| Object | Contents |
+| --- | --- |
+| `tx_meta_v2` | One execution-metadata row per transaction, keyed by `(slot, tx_idx)` |
+| `pubkey_mentions` | Per-slot transaction-message account-key mention counts |
+| `pubkeys` | Deduplicated pubkey-to-`sipHash64` ID mapping |
+| `pubkeys_mv` | Materialized view that populates `pubkeys` from `pubkey_mentions` |
+| `account_write_stats` | Per-block account-write count, distinct accounts, and total data bytes |
+
+The default pipeline aggregates account writes into `account_write_stats`; it does not persist one
+raw ClickHouse row for every account update contained in the `.jet` archive.
+
+After a clean, single import, ordinary queries do not need `FINAL`. The tables use
+`ReplacingMergeTree`, so importing the same slots again can expose duplicate physical rows until
+ClickHouse merges them. For a deterministic refresh, delete only the affected range from the
+three slot-keyed output tables before importing it again:
+
+```sql
+ALTER TABLE tx_meta_v2
+  DELETE WHERE slot BETWEEN 441851484 AND 441852483
+  SETTINGS mutations_sync = 2;
+ALTER TABLE pubkey_mentions
+  DELETE WHERE slot BETWEEN 441851484 AND 441852483
+  SETTINGS mutations_sync = 2;
+ALTER TABLE account_write_stats
+  DELETE WHERE slot BETWEEN 441851484 AND 441852483
+  SETTINGS mutations_sync = 2;
+```
+
+Do not drop shared tables merely to refresh one archive. Use `FINAL` only when a query must hide
+transient duplicates from repeated imports that have not yet merged.
 
 See [How Snapshot Replay Works](docs/how-snapshot-replay-works.md) for the cache layout, cleanup
 scope, verification behavior, and replay pipeline in detail.
