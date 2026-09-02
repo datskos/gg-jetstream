@@ -5,6 +5,7 @@ pub mod convert;
 pub mod dedupe;
 pub mod entries;
 pub mod epochs;
+pub mod ggjet;
 pub mod limits;
 pub mod pubkey_prime;
 pub mod transactions;

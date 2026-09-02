@@ -41,7 +41,7 @@ use log::{error, info, warn};
 use rayon::prelude::*;
 use reqwest::{Client, Url, header::RANGE};
 use serde_cbor::Value;
-use solana_account::AccountSharedData;
+use solana_account::{AccountSharedData, ReadableAccount};
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig,
     accounts_index::{AccountsIndexConfig, IndexLimit},
@@ -125,9 +125,7 @@ static ENTRY_EXEC_FAIL_AFTER: std::sync::LazyLock<Duration> = std::sync::LazyLoc
     Duration::from_secs(secs)
 });
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 const DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED: bool = true;
 // Roots are set every `DEFAULT_ROOT_INTERVAL` slots; running the accounts
 // maintenance pass (flush + clean + shrink, ~30-40s of replay-visible drag)
@@ -145,9 +143,6 @@ const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
 const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 16;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
-static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
-static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
-static PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT: AtomicU64 = AtomicU64::new(0);
 
 // Phase timing counters (cumulative microseconds)
 static PHASE_GATE_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -380,14 +375,12 @@ struct BankReplay {
     cursor: Arc<ReplayCursor>,
     scheduler: Arc<TransactionScheduler>,
     debug_signature: Option<Signature>,
-    prune_inflight: Arc<AtomicBool>,
     accounts_maintenance_inflight: Arc<AtomicBool>,
+    ggjet_checkpoint_initialized: AtomicBool,
     last_root_set: Arc<AtomicU64>,
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
-    firehose_gate: Arc<Mutex<()>>,
     live_start_slot: Slot,
-    enable_program_cache_prune: bool,
     enable_accounts_maintenance: bool,
     accounts_maintenance_root_stride: u64,
     /// Pool for executing mutually non-conflicting entry batches in
@@ -586,6 +579,20 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Keep the program-cache fork graph transition ordered. The cache must be
+/// pruned while the old ancestry is still present; only then may BankForks
+/// discard that ancestry by setting its new root.
+fn apply_root_transition<T>(
+    state: &mut T,
+    prune_program_cache: impl FnOnce(&mut T),
+    after_prune: impl FnOnce(&T),
+    set_root: impl FnOnce(&mut T),
+) {
+    prune_program_cache(state);
+    after_prune(state);
+    set_root(state);
+}
+
 impl BankReplay {
     #[allow(clippy::too_many_arguments)] // replay wiring carries its full context set
     fn new(
@@ -595,9 +602,7 @@ impl BankReplay {
         failure: Arc<ReplayFailure>,
         cursor: Arc<ReplayCursor>,
         scheduler: Arc<TransactionScheduler>,
-        firehose_gate: Arc<Mutex<()>>,
         live_start_slot: Slot,
-        enable_program_cache_prune: bool,
         enable_accounts_maintenance: bool,
         accounts_maintenance_root_stride: u64,
     ) -> Self {
@@ -611,9 +616,7 @@ impl BankReplay {
             failure,
             cursor,
             scheduler,
-            firehose_gate,
             live_start_slot,
-            enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride,
         )
@@ -632,9 +635,7 @@ impl BankReplay {
         failure: Arc<ReplayFailure>,
         cursor: Arc<ReplayCursor>,
         scheduler: Arc<TransactionScheduler>,
-        firehose_gate: Arc<Mutex<()>>,
         live_start_slot: Slot,
-        enable_program_cache_prune: bool,
         enable_accounts_maintenance: bool,
         accounts_maintenance_root_stride: u64,
     ) -> Self {
@@ -691,14 +692,12 @@ impl BankReplay {
             cursor,
             scheduler,
             debug_signature,
-            prune_inflight: Arc::new(AtomicBool::new(false)),
             accounts_maintenance_inflight: Arc::new(AtomicBool::new(false)),
+            ggjet_checkpoint_initialized: AtomicBool::new(false),
             last_root_set: Arc::new(AtomicU64::new(0)),
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
-            firehose_gate,
             live_start_slot,
-            enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
             replay_pool,
@@ -713,20 +712,36 @@ impl BankReplay {
         self.bank_forks.clone()
     }
 
+    /// Capture immediately when the loaded/carried Bank is already the exact
+    /// pre-range checkpoint. Older snapshots defer capture to `bank_for_slot`
+    /// after warmup reaches the target boundary.
+    fn initialize_ggjet_checkpoint_if_exact(&self) -> Result<(), String> {
+        let bank = self
+            .bank_forks
+            .read()
+            .map_err(|_| "bank forks lock poisoned during ggjet checkpoint preflight".to_string())?
+            .working_bank();
+        if bank.slot() != self.live_start_slot.saturating_sub(1) {
+            return Ok(());
+        }
+        if !self
+            .ggjet_checkpoint_initialized
+            .swap(true, Ordering::SeqCst)
+        {
+            if let Err(err) = horizon::initialize_ggjet_checkpoint(&bank) {
+                self.ggjet_checkpoint_initialized
+                    .store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
         let guard = self.cached_bank.lock().ok()?;
         guard
             .as_ref()
             .and_then(|cached| (cached.slot == slot).then(|| Arc::clone(&cached.bank)))
-    }
-
-    fn maybe_prune_program_cache_by_deployment_slot(&self, bank: &Bank) {
-        let slot = PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT.swap(0, Ordering::Relaxed);
-        if slot == 0 {
-            return;
-        }
-        warn!("pruning program cache by deployment slot {}", slot);
-        bank.prune_program_cache_by_deployment_slot(slot);
     }
 
     fn update_cached_bank(&self, bank: Arc<Bank>) {
@@ -777,7 +792,19 @@ impl BankReplay {
             parent.freeze();
             let frozen_bank = parent.clone();
             let parent_slot = parent.slot();
-            let mut prune_request = None::<Slot>;
+            if slot >= self.live_start_slot
+                && !self
+                    .ggjet_checkpoint_initialized
+                    .swap(true, Ordering::SeqCst)
+            {
+                self.cursor
+                    .update_inflight_stage("ggjet_checkpoint_capture");
+                if let Err(err) = horizon::initialize_ggjet_checkpoint(&parent) {
+                    self.ggjet_checkpoint_initialized
+                        .store(false, Ordering::SeqCst);
+                    return Err(err);
+                }
+            }
             let mut accounts_maintenance_request = None::<Slot>;
             self.cursor.update_inflight_stage("set_root");
             self.leader_schedule_cache.set_root(&frozen_bank);
@@ -823,39 +850,80 @@ impl BankReplay {
                 let root_slot = parent_slot.saturating_sub(parent_slot % interval);
                 let last_root = self.last_root_set.load(Ordering::Relaxed);
                 if root_slot > 0 && root_slot > last_root {
-                    self.cursor.update_inflight_stage("root_set");
-                    let root_start = Instant::now();
-                    if guard.get(root_slot).is_some() {
-                        guard.set_root(root_slot, None, None);
+                    if let Some(root_bank) = guard.get(root_slot) {
+                        // Program-cache entries use BankForks to decide whether a cached
+                        // deployment is on the current fork. Pruning after set_root loses
+                        // the ancestry needed for that decision and can make the cooperative
+                        // loader retry ProgramCache::assign_program forever. Agave performs
+                        // this prune synchronously against the old graph before rerooting.
+                        self.cursor
+                            .update_inflight_stage("root_prune_program_cache");
+                        let prune_start = Instant::now();
+                        let rss_before = read_rss_bytes();
+                        info!(
+                            "bank_for_slot program cache prune starting: slot {}",
+                            root_slot
+                        );
+                        apply_root_transition(
+                            &mut *guard,
+                            |bank_forks| root_bank.prune_program_cache(bank_forks),
+                            |_bank_forks| {
+                                let rss_after = read_rss_bytes();
+                                let rss_saved = match (rss_before, rss_after) {
+                                    (Some(before), Some(after)) if before > after => {
+                                        format_bytes(before - after)
+                                    }
+                                    (Some(_), Some(_)) => "0B".to_string(),
+                                    _ => "n/a".to_string(),
+                                };
+                                let prune_elapsed = prune_start.elapsed();
+                                info!(
+                                    "bank_for_slot program cache prune finished: slot {} took {:.3}s rss_saved={}",
+                                    root_slot,
+                                    prune_elapsed.as_secs_f64(),
+                                    rss_saved
+                                );
+                                if prune_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                                    warn!(
+                                        "bank_for_slot program cache prune slow: slot {} took {:.3}s rss_saved={}",
+                                        root_slot,
+                                        prune_elapsed.as_secs_f64(),
+                                        rss_saved
+                                    );
+                                }
+                                self.cursor.update_inflight_stage("root_set");
+                            },
+                            |bank_forks| {
+                                let root_start = Instant::now();
+                                bank_forks.set_root(root_slot, None, None);
+                                let set_elapsed = root_start.elapsed();
+                                info!(
+                                    "bank_for_slot root set finished: slot {} took {:.3}s",
+                                    root_slot,
+                                    set_elapsed.as_secs_f64()
+                                );
+                                if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                                    warn!(
+                                        "bank_for_slot root set slow: slot {} took {:.3}s",
+                                        root_slot,
+                                        set_elapsed.as_secs_f64()
+                                    );
+                                }
+                            },
+                        );
+                        if self.enable_accounts_maintenance {
+                            let root_index = root_slot / interval;
+                            if root_index % self.accounts_maintenance_root_stride == 0 {
+                                accounts_maintenance_request = Some(root_slot);
+                            }
+                        }
                     } else {
                         warn!(
-                            "bank_for_slot program cache prune skipped: missing root bank slot {}",
+                            "bank_for_slot root transition skipped: missing root bank slot {}",
                             root_slot
                         );
                     }
                     self.last_root_set.store(root_slot, Ordering::Relaxed);
-                    let set_elapsed = root_start.elapsed();
-                    if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                        warn!(
-                            "bank_for_slot root set slow: slot {} took {:.3}s",
-                            root_slot,
-                            set_elapsed.as_secs_f64()
-                        );
-                    }
-                    if self.enable_program_cache_prune {
-                        prune_request = Some(root_slot);
-                    } else {
-                        warn!(
-                            "bank_for_slot skipping program cache prune at slot {} (debug)",
-                            root_slot
-                        );
-                    }
-                    if self.enable_accounts_maintenance {
-                        let root_index = root_slot / interval;
-                        if root_index % self.accounts_maintenance_root_stride == 0 {
-                            accounts_maintenance_request = Some(root_slot);
-                        }
-                    }
                 }
             }
             self.cursor.update_inflight_stage("clone_without_scheduler");
@@ -925,145 +993,6 @@ impl BankReplay {
                     warn!(
                         "accounts maintenance skipped at root slot {} (already running)",
                         root_slot
-                    );
-                }
-            }
-            if let Some(prune_slot) = prune_request {
-                let inflight = self.prune_inflight.clone();
-                let bank_forks = Arc::clone(&self.bank_forks);
-                let execution_gate = self.execution_gate.clone();
-                let firehose_gate = self.firehose_gate.clone();
-                let _cursor = self.cursor.clone();
-                let scheduler = self.scheduler.clone();
-                if inflight
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    std::thread::spawn(move || {
-                        let start = Instant::now();
-                        let mut last_progress = Instant::now();
-                        // Acquire firehose_gate FIRST to pause firehose delivery,
-                        // allowing the ready_sender channel to drain. If we acquired
-                        // execution_gate first, replay would stall, the channel would
-                        // fill, and the firehose notifier would block while holding
-                        // firehose_gate — deadlocking with us.
-                        let _firehose_guard = loop {
-                            if let Ok(guard) = firehose_gate.try_lock() {
-                                break guard;
-                            }
-                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
-                                warn!(
-                                    "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
-                                    prune_slot
-                                );
-                                last_progress = Instant::now();
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        };
-                        last_progress = Instant::now();
-                        let _execution_guard = loop {
-                            if let Ok(guard) = execution_gate.try_lock() {
-                                break guard;
-                            }
-                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
-                                warn!(
-                                    "bank_for_slot waiting on execution gate for program cache prune: slot {}",
-                                    prune_slot
-                                );
-                                last_progress = Instant::now();
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        };
-                        // Pruning pauses firehose delivery but does not imply a restart. Avoid
-                        // recording a resume target here to prevent skipping data on normal resume.
-                        scheduler.clear_resume_target();
-                        let (done_tx, done_rx) = std::sync::mpsc::channel();
-                        let bank_forks = Arc::clone(&bank_forks);
-                        std::thread::spawn(move || {
-                            let mut last_progress = Instant::now();
-                            let bank_forks_guard = loop {
-                                match bank_forks.try_read() {
-                                    Ok(guard) => break guard,
-                                    Err(_) => {
-                                        if last_progress.elapsed()
-                                            >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
-                                        {
-                                            warn!(
-                                                "bank_for_slot waiting on bank forks read lock for program cache prune: slot {}",
-                                                prune_slot
-                                            );
-                                            last_progress = Instant::now();
-                                        }
-                                        std::thread::sleep(Duration::from_millis(10));
-                                    }
-                                }
-                            };
-                            let bank = bank_forks_guard.get(prune_slot);
-                            let Some(bank) = bank else {
-                                warn!(
-                                    "bank_for_slot program cache prune skipped: missing root bank slot {}",
-                                    prune_slot
-                                );
-                                inflight.store(false, Ordering::SeqCst);
-                                let _ = done_tx.send(());
-                                return;
-                            };
-                            info!(
-                                "bank_for_slot program cache prune starting: slot {}",
-                                prune_slot
-                            );
-                            let rss_before = read_rss_bytes();
-                            bank.prune_program_cache(&bank_forks_guard);
-                            let rss_after = read_rss_bytes();
-                            let rss_saved = match (rss_before, rss_after) {
-                                (Some(before), Some(after)) if before > after => {
-                                    format_bytes(before - after)
-                                }
-                                (Some(_), Some(_)) => "0B".to_string(),
-                                _ => "n/a".to_string(),
-                            };
-                            let elapsed = start.elapsed();
-                            info!(
-                                "bank_for_slot program cache prune finished: slot {} took {:.3}s rss_saved={}",
-                                prune_slot,
-                                elapsed.as_secs_f64(),
-                                rss_saved
-                            );
-                            if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                                warn!(
-                                    "bank_for_slot program cache prune async: slot {} took {:.3}s rss_saved={}",
-                                    prune_slot,
-                                    elapsed.as_secs_f64(),
-                                    rss_saved
-                                );
-                            }
-                            inflight.store(false, Ordering::SeqCst);
-                            let _ = done_tx.send(());
-                        });
-                        loop {
-                            match done_rx.recv_timeout(PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL) {
-                                Ok(()) => break,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    warn!(
-                                        "bank_for_slot program cache prune still running after {:.3}s: slot {}",
-                                        start.elapsed().as_secs_f64(),
-                                        prune_slot
-                                    );
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    warn!(
-                                        "bank_for_slot program cache prune worker disconnected: slot {}",
-                                        prune_slot
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    warn!(
-                        "bank_for_slot skipping program cache prune at slot {} (already running)",
-                        prune_slot
                     );
                 }
             }
@@ -1618,8 +1547,6 @@ impl BankReplay {
             phase_bank_start.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        self.maybe_prune_program_cache_by_deployment_slot(&bank);
-
         // Phase 1: sanitize every transaction in the slot in parallel — the
         // CPU-heavy message-hash + address-table-resolution step that
         // dominated serial replay. This is safe to do up front: ALT
@@ -2561,23 +2488,6 @@ impl ReplayCursor {
     }
 }
 
-fn extract_program_cache_deployment_slot(message: &str) -> Option<u64> {
-    let marker = "entry=ProgramCacheEntry";
-    let (_, after_marker) = message.split_once(marker)?;
-    let key = "deployment_slot:";
-    let (_, after_key) = after_marker.split_once(key)?;
-    let digits: String = after_key
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse().ok()
-    }
-}
-
 #[derive(Debug)]
 struct InFlightEntry {
     slot: Slot,
@@ -2695,31 +2605,12 @@ impl log::Log for AbortOnErrorLogger {
                     .mark_restart(restart_slot, entry_index, tx_start, true);
             }
         }
-        if record.target() == "solana_program_runtime::loaded_programs"
+        let fatal_program_cache_assign = record.target()
+            == "solana_program_runtime::loaded_programs"
             && record
                 .args()
                 .to_string()
-                .contains("ProgramCache::assign_program() failed")
-        {
-            PROGRAM_CACHE_ASSIGN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
-            let message = record.args().to_string();
-            if let Some(deployment_slot) = extract_program_cache_deployment_slot(&message) {
-                PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT.store(deployment_slot, Ordering::Relaxed);
-            }
-            if LOGGED_PROGRAM_CACHE_ASSIGN_FAIL.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            if let Some(deployment_slot) = extract_program_cache_deployment_slot(&message) {
-                eprintln!(
-                    "suppressing repeated ProgramCache::assign_program() failed logs (will prune deployment_slot={deployment_slot})"
-                );
-            } else {
-                eprintln!(
-                    "suppressing repeated ProgramCache::assign_program() failed logs (benign)"
-                );
-            }
-            return;
-        }
+                .contains("ProgramCache::assign_program() failed");
 
         if record.target() == "solana_accounts_db::accounts_db" {
             let message = record.args().to_string();
@@ -2729,17 +2620,25 @@ impl log::Log for AbortOnErrorLogger {
         }
 
         self.inner.log(record);
-        if self.abort_on_error && record.level() == log::Level::Error {
-            if record.target().starts_with("jetstreamer::firehose") {
+        if fatal_program_cache_assign
+            || (self.abort_on_error && record.level() == log::Level::Error)
+        {
+            if !fatal_program_cache_assign && record.target().starts_with("jetstreamer::firehose") {
                 // Firehose handles retries/rollbacks internally; do not abort the process on
                 // any firehose error logs.
                 return;
+            }
+            if fatal_program_cache_assign {
+                eprintln!(
+                    "fatal program-cache assignment invariant violation; aborting instead of retrying forever"
+                );
             }
             let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
             eprintln!(
                 "replay cursor at error: slot={slot} entry={entry_index} tx_start={tx_start} tx_count={tx_count} sig={}",
                 signature.as_deref().unwrap_or("<unknown>")
             );
+            self.inner.flush();
             self.shutdown.store(true, Ordering::SeqCst);
             std::process::exit(1);
         }
@@ -3381,11 +3280,6 @@ impl TransactionScheduler {
             "firehose pause recorded resume target: slot {} entry {} tx_index {}",
             slot, entry_index, tx_start
         );
-    }
-
-    fn clear_resume_target(&self) {
-        let mut guard = self.resume_target.lock().expect("resume target lock");
-        *guard = None;
     }
 
     fn slot_presence_locked(
@@ -4529,6 +4423,8 @@ struct SlotReplayOptions {
     cache_dir: Option<PathBuf>,
     verify_snapshots: bool,
     horizon_output: Option<PathBuf>,
+    ggjet_output: Option<PathBuf>,
+    ggjet_manifest: Option<PathBuf>,
 }
 
 /// Parses the slot replay form accepted by `replay-slots`: an inclusive
@@ -4579,6 +4475,8 @@ where
         cache_dir: None,
         verify_snapshots,
         horizon_output: None,
+        ggjet_output: None,
+        ggjet_manifest: None,
     };
     for arg in args {
         if arg == "--verify" {
@@ -4593,6 +4491,22 @@ where
                 return Err("--horizon-output may only be specified once".to_string());
             }
             options.horizon_output = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--ggjet-output=") {
+            if path.is_empty() {
+                return Err("--ggjet-output requires a nonempty path".to_string());
+            }
+            if options.ggjet_output.is_some() {
+                return Err("--ggjet-output may only be specified once".to_string());
+            }
+            options.ggjet_output = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--ggjet-manifest=") {
+            if path.is_empty() {
+                return Err("--ggjet-manifest requires a nonempty path".to_string());
+            }
+            if options.ggjet_manifest.is_some() {
+                return Err("--ggjet-manifest may only be specified once".to_string());
+            }
+            options.ggjet_manifest = Some(PathBuf::from(path));
         } else if arg.starts_with('-') {
             return Err(format!("unknown replay-slots option '{arg}'"));
         } else if options.cache_dir.is_none() {
@@ -4601,15 +4515,27 @@ where
             return Err(format!("unexpected replay-slots argument '{arg}'"));
         }
     }
+    if options.ggjet_output.is_some() && options.ggjet_manifest.is_none() {
+        return Err("--ggjet-output requires --ggjet-manifest=PATH".to_string());
+    }
+    if options.ggjet_manifest.is_some() && options.ggjet_output.is_none() {
+        return Err("--ggjet-manifest requires --ggjet-output=PATH".to_string());
+    }
+    if options.ggjet_output.is_some() && options.horizon_output.is_none() {
+        return Err("--ggjet-output requires --horizon-output=PATH".to_string());
+    }
     Ok(options)
 }
 
 fn usage(program: &str) -> String {
     format!(
         "Usage:\n\
-         {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
+         {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH] \
+         [--ggjet-output=PATH --ggjet-manifest=PATH]\n\
          {program} replay-slots START:END [cache-dir] [--verify|--no-verify] \
-         [--horizon-output=PATH]\n\
+         [--horizon-output=PATH] [--ggjet-output=PATH --ggjet-manifest=PATH]\n\
+         {program} ggjet-from-jet JET SNAPSHOT CACHE-DIR OUTPUT MANIFEST\n\
+         {program} verify-ggjet PATH\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -6195,6 +6121,8 @@ struct ReplayWindow {
     end_inclusive: Slot,
     horizon_output: Option<PathBuf>,
     horizon_file_mode: horizon::ArchiveFileMode,
+    ggjet_output: Option<PathBuf>,
+    ggjet_manifest: Option<PathBuf>,
     use_dir_loader: bool,
 }
 
@@ -6238,6 +6166,8 @@ async fn run_geyser_replay(
         end_inclusive,
         horizon_output,
         horizon_file_mode,
+        ggjet_output,
+        ggjet_manifest,
         use_dir_loader,
     } = window;
     let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(target_start)));
@@ -6344,13 +6274,20 @@ async fn run_geyser_replay(
         info!("empty-slot gap guard disabled");
     }
     if let Some(horizon_output) = horizon_output.as_ref() {
-        horizon::init(
+        horizon::init_with_ggjet(
             horizon_output,
             epoch,
             target_start,
             end_inclusive - target_start + 1,
             slot_presence.clone(),
             horizon_file_mode,
+            ggjet_output
+                .as_deref()
+                .zip(ggjet_manifest.as_deref())
+                .map(|(path, manifest_path)| horizon::GgjetOutput {
+                    path,
+                    manifest_path,
+                }),
         )?;
         info!(
             "horizon archive recording to {} (epoch {}, slots {}..={})",
@@ -6381,16 +6318,12 @@ async fn run_geyser_replay(
         info!("firehose backpressure disabled");
     }
     let firehose_gate = Arc::new(Mutex::new(()));
-    let enable_program_cache_prune = env_truthy_default(
-        "JETSTREAMER_PROGRAM_CACHE_PRUNE",
-        DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED,
-    );
-    if enable_program_cache_prune {
-        info!("program cache pruning enabled");
-        info!("firehose paused during program cache pruning");
-    } else {
-        info!("program cache pruning disabled");
+    if env::var_os("JETSTREAMER_PROGRAM_CACHE_PRUNE").is_some() {
+        warn!(
+            "JETSTREAMER_PROGRAM_CACHE_PRUNE is ignored; program cache pruning is required at root transitions"
+        );
     }
+    info!("program cache pruning is synchronous before each root transition");
     let enable_accounts_maintenance = env_truthy_default(
         "JETSTREAMER_ACCOUNTS_MAINTENANCE",
         DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED,
@@ -6416,9 +6349,7 @@ async fn run_geyser_replay(
             failure.clone(),
             cursor.clone(),
             scheduler.clone(),
-            firehose_gate.clone(),
             target_start,
-            enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride,
         ),
@@ -6429,13 +6360,12 @@ async fn run_geyser_replay(
             failure.clone(),
             cursor.clone(),
             scheduler.clone(),
-            firehose_gate.clone(),
             target_start,
-            enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride,
         ),
     });
+    bank_replay.initialize_ggjet_checkpoint_if_exact()?;
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
     let (ready_sender, ready_receiver) = bounded::<ReadyQueueMessage>(ready_queue_capacity);
@@ -7173,11 +7103,6 @@ async fn run_geyser_replay(
                     }
                     maybe_log_phases(false);
                 }
-
-                let assign_fail = PROGRAM_CACHE_ASSIGN_FAIL_COUNT.load(Ordering::Relaxed);
-                if assign_fail > 0 {
-                    info!("program cache assign failures so far: {assign_fail}");
-                }
             }
         })
     };
@@ -7752,11 +7677,275 @@ fn prepare_horizon_output(path: &Path) -> Result<(), String> {
     ensure_horizon_output_absent(path)
 }
 
+fn write_ggjet_checkpoint<W: std::io::Write>(
+    writer: &mut jetstreamer_horizon::ggjet::GgjetWriter<W>,
+    bank: &Bank,
+) -> Result<(), String> {
+    use jetstreamer_horizon::ggjet::CheckpointAccountView;
+
+    const LOG_EVERY: u64 = 25_000;
+    let started = Instant::now();
+    let accounts = writer.manifest().accounts().to_vec();
+    info!(
+        "ggjet offline checkpoint starting: checkpoint_slot={} bank_slot={} accounts={}",
+        writer.header().checkpoint_slot,
+        bank.slot(),
+        accounts.len()
+    );
+    for (ordinal, address) in accounts.iter().enumerate() {
+        let pubkey = solana_pubkey::Pubkey::new_from_array(address.to_bytes());
+        match bank.get_account_modified_slot(&pubkey) {
+            Some((account, last_modified_slot)) => writer
+                .write_checkpoint_account(Some(CheckpointAccountView {
+                    last_modified_slot,
+                    lamports: account.lamports(),
+                    owner: Address::new_from_array(account.owner().to_bytes()),
+                    executable: account.executable(),
+                    rent_epoch: account.rent_epoch(),
+                    data: account.data(),
+                }))
+                .map_err(|err| format!("failed to write ggjet checkpoint: {err}"))?,
+            None => writer
+                .write_checkpoint_account(None)
+                .map_err(|err| format!("failed to write absent ggjet checkpoint record: {err}"))?,
+        }
+        let done = ordinal as u64 + 1;
+        if done.is_multiple_of(LOG_EVERY) || done == accounts.len() as u64 {
+            info!(
+                "ggjet offline checkpoint progress: {}/{} ({:.1}%) present={} elapsed={:.1}s",
+                done,
+                accounts.len(),
+                done as f64 * 100.0 / accounts.len().max(1) as f64,
+                writer.stats().checkpoint_present,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    writer
+        .finish_checkpoint()
+        .map_err(|err| format!("failed to finish ggjet checkpoint: {err}"))?;
+    Ok(())
+}
+
+async fn run_ggjet_from_jet_command(
+    jet_path: &Path,
+    snapshot_path: &Path,
+    cache_dir: &Path,
+    output_path: &Path,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    use jetstreamer_horizon::{
+        archive::ArchiveReader,
+        ggjet::{
+            AccountManifest, GgjetReader, GgjetWriter, GgjetWriterConfig, copy_updates_from_jet,
+        },
+    };
+
+    ensure_horizon_output_absent(output_path)?;
+    prepare_horizon_output(output_path)?;
+    let source_file = fs::File::open(jet_path)
+        .map_err(|err| format!("failed to open source .jet {}: {err}", jet_path.display()))?;
+    let source_reader = ArchiveReader::open(std::io::BufReader::new(source_file))
+        .map_err(|err| format!("failed to parse source .jet {}: {err}", jet_path.display()))?;
+    let update_start_slot = source_reader.header().slot_start;
+    let update_slot_count = source_reader.header().slot_count;
+    drop(source_reader);
+    let checkpoint_slot = update_start_slot
+        .checked_sub(1)
+        .ok_or_else(|| "source .jet starts at slot zero; no checkpoint slot exists".to_string())?;
+    // Manifest validation is deliberately before the expensive snapshot Bank
+    // load so a typo/digest mismatch fails in seconds, not minutes later.
+    let manifest = AccountManifest::load(manifest_path).map_err(|err| {
+        format!(
+            "failed to load account manifest {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+
+    let snapshot_info = FullSnapshotArchiveInfo::new_from_path(snapshot_path.to_path_buf())
+        .map_err(|err| {
+            format!(
+                "failed to parse snapshot archive {}: {err}",
+                snapshot_path.display()
+            )
+        })?;
+    if snapshot_info.slot() != checkpoint_slot {
+        return Err(format!(
+            "offline conversion requires a snapshot exactly at checkpoint slot {checkpoint_slot}, \
+             but {} is at slot {}; use replay-slots with --ggjet-output if warmup is required",
+            snapshot_path.display(),
+            snapshot_info.slot()
+        ));
+    }
+
+    fs::create_dir_all(cache_dir).map_err(|err| {
+        format!(
+            "failed to create ggjet conversion cache {}: {err}",
+            cache_dir.display()
+        )
+    })?;
+    ensure_genesis_archive(cache_dir).await?;
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+        clear_ledger_accounts_state(cache_dir)?;
+    }
+
+    let cache_dir_owned = cache_dir.to_path_buf();
+    let snapshot_owned = snapshot_path.to_path_buf();
+    info!("loading checkpoint Bank from {}", snapshot_path.display());
+    let bank = tokio::task::spawn_blocking(move || {
+        load_bank_from_snapshot_archive(&cache_dir_owned, &snapshot_owned, None)
+    })
+    .await
+    .map_err(|err| format!("snapshot Bank load task failed: {err}"))??;
+    if bank.slot() != checkpoint_slot {
+        return Err(format!(
+            "loaded Bank is at slot {}, expected checkpoint slot {checkpoint_slot}",
+            bank.slot()
+        ));
+    }
+
+    let output_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .map_err(|err| format!("failed to create {}: {err}", output_path.display()))?;
+    let conversion = (|| -> Result<_, String> {
+        let mut writer = GgjetWriter::new(
+            std::io::BufWriter::with_capacity(8 << 20, output_file),
+            manifest,
+            checkpoint_slot,
+            update_start_slot,
+            update_slot_count,
+            GgjetWriterConfig::default(),
+        )
+        .map_err(|err| format!("failed to initialize ggjet output: {err}"))?;
+        write_ggjet_checkpoint(&mut writer, &bank)?;
+
+        let source_file = fs::File::open(jet_path)
+            .map_err(|err| format!("failed to reopen source .jet: {err}"))?;
+        info!(
+            "copying selected updates from {} for slots {}..={} (no replay)",
+            jet_path.display(),
+            update_start_slot,
+            update_start_slot
+                .saturating_add(update_slot_count)
+                .saturating_sub(1),
+        );
+        let copied = copy_updates_from_jet(
+            std::io::BufReader::with_capacity(8 << 20, source_file),
+            &mut writer,
+        )
+        .map_err(|err| format!("failed to copy .jet updates: {err}"))?;
+        let (sink, stats) = writer
+            .finish()
+            .map_err(|err| format!("failed to finalize ggjet: {err}"))?;
+        sink.into_inner()
+            .map_err(|err| format!("failed to flush ggjet: {err}"))?;
+        Ok((copied, stats))
+    })();
+    let (copied, stats) = match conversion {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = fs::remove_file(output_path);
+            return Err(err);
+        }
+    };
+
+    let verify_file = fs::File::open(output_path)
+        .map_err(|err| format!("failed to reopen completed ggjet: {err}"))?;
+    let verified = GgjetReader::open(std::io::BufReader::new(verify_file))
+        .map_err(|err| format!("completed ggjet failed footer/index validation: {err}"))?;
+    if verified.header().account_set_sha256 != verified.manifest().digest() {
+        return Err("completed ggjet embedded manifest digest mismatch".into());
+    }
+    println!(
+        "ggjet complete: path={} checkpoint_slot={} checkpoint_accounts={} present={} slots={} updates={} buckets={} bytes={} copied_slots={}",
+        output_path.display(),
+        checkpoint_slot,
+        stats.checkpoint_accounts,
+        stats.checkpoint_present,
+        stats.slots,
+        stats.updates,
+        stats.buckets,
+        stats.bytes_written,
+        copied,
+    );
+    Ok(())
+}
+
+fn run_verify_ggjet_command(path: &Path) -> Result<(), String> {
+    use jetstreamer_horizon::ggjet::{
+        CheckpointAccountView, GgjetReader, GgjetUpdateView, GgjetVisitor,
+    };
+
+    #[derive(Default)]
+    struct Counter {
+        checkpoint: u64,
+        present: u64,
+        checkpoint_data: u64,
+        updates: u64,
+        update_data: u64,
+    }
+    impl GgjetVisitor for Counter {
+        fn on_checkpoint(&mut self, _pubkey: Address, account: Option<CheckpointAccountView<'_>>) {
+            self.checkpoint += 1;
+            if let Some(account) = account {
+                self.present += 1;
+                self.checkpoint_data += account.data.len() as u64;
+            }
+        }
+
+        fn on_update(&mut self, _slot: u64, update: GgjetUpdateView<'_>) {
+            self.updates += 1;
+            self.update_data += update.data.len() as u64;
+        }
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open ggjet {}: {err}", path.display()))?;
+    let mut reader = GgjetReader::open(std::io::BufReader::with_capacity(8 << 20, file))
+        .map_err(|err| format!("failed to parse ggjet {}: {err}", path.display()))?;
+    let header = reader.header().clone();
+    let buckets = reader.bucket_index().len();
+    let mut counter = Counter::default();
+    reader
+        .visit_checkpoint(&mut counter)
+        .map_err(|err| format!("checkpoint verification failed: {err}"))?;
+    let slots = reader
+        .visit_slots(
+            header.update_start_slot,
+            header.update_slot_count,
+            &mut counter,
+        )
+        .map_err(|err| format!("update verification failed: {err}"))?;
+    println!(
+        "ggjet verified: path={} checkpoint_slot={} accounts={} present={} slots={} updates={} buckets={} checkpoint_data={} update_data={} digest={}",
+        path.display(),
+        header.checkpoint_slot,
+        counter.checkpoint,
+        counter.present,
+        slots,
+        counter.updates,
+        buckets,
+        counter.checkpoint_data,
+        counter.update_data,
+        header
+            .account_set_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_slot_replay_command(
     range: SlotReplayRange,
     cache_dir: &Path,
     verify_snapshots: bool,
     horizon_output: Option<PathBuf>,
+    ggjet_output: Option<PathBuf>,
+    ggjet_manifest: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
@@ -7774,6 +7963,33 @@ async fn run_slot_replay_command(
     if let Some(path) = horizon_output.as_ref() {
         ensure_horizon_output_absent(path)?;
     }
+    if let Some(path) = ggjet_output.as_ref() {
+        ensure_horizon_output_absent(path)?;
+    }
+    if horizon_output
+        .as_ref()
+        .zip(ggjet_output.as_ref())
+        .is_some_and(|(jet, ggjet)| jet == ggjet)
+    {
+        return Err("--horizon-output and --ggjet-output must be different paths".into());
+    }
+    if let Some(path) = ggjet_manifest.as_ref() {
+        let manifest = jetstreamer_horizon::ggjet::AccountManifest::load(path).map_err(|err| {
+            format!(
+                "failed to validate ggjet manifest {}: {err}",
+                path.display()
+            )
+        })?;
+        info!(
+            "ggjet manifest preflight complete: accounts={} digest={}",
+            manifest.len(),
+            manifest
+                .digest()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
 
     // Replay mutates its live AccountsDB paths. Preserve downloaded archives
     // and pristine archive extractions, but rebuild all mutable state before
@@ -7784,6 +8000,9 @@ async fn run_slot_replay_command(
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
     if let Some(path) = horizon_output.as_ref() {
+        prepare_horizon_output(path)?;
+    }
+    if let Some(path) = ggjet_output.as_ref() {
         prepare_horizon_output(path)?;
     }
 
@@ -7873,6 +8092,8 @@ async fn run_slot_replay_command(
             end_inclusive: range.end_inclusive,
             horizon_output,
             horizon_file_mode: horizon::ArchiveFileMode::CreateNew,
+            ggjet_output,
+            ggjet_manifest,
             // replay-slots always consumes the explicitly selected archive;
             // a global dir-loader toggle must not silently bypass it.
             use_dir_loader: false,
@@ -7950,6 +8171,51 @@ async fn main() {
         return;
     }
 
+    if epoch_arg == "ggjet-from-jet" {
+        let values = args.collect::<Vec<_>>();
+        if values.len() != 5 {
+            eprintln!("ggjet-from-jet requires JET SNAPSHOT CACHE-DIR OUTPUT MANIFEST");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        }
+        let jet_path = PathBuf::from(&values[0]);
+        let snapshot_path = PathBuf::from(&values[1]);
+        let cache_dir = PathBuf::from(&values[2]);
+        let output_path = PathBuf::from(&values[3]);
+        let manifest_path = PathBuf::from(&values[4]);
+        if let Err(err) = enable_file_logging(&cache_dir) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        if let Err(err) = run_ggjet_from_jet_command(
+            &jet_path,
+            &snapshot_path,
+            &cache_dir,
+            &output_path,
+            &manifest_path,
+        )
+        .await
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        return;
+    }
+
+    if epoch_arg == "verify-ggjet" {
+        let values = args.collect::<Vec<_>>();
+        if values.len() != 1 {
+            eprintln!("verify-ggjet requires PATH");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        }
+        if let Err(err) = run_verify_ggjet_command(Path::new(&values[0])) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        return;
+    }
+
     if epoch_arg == "replay-slots" {
         let Some(range_arg) = args.next() else {
             eprintln!("replay-slots requires an inclusive START:END range");
@@ -7983,6 +8249,8 @@ async fn main() {
             cache_dir: cache_dir_arg,
             verify_snapshots,
             horizon_output,
+            ggjet_output,
+            ggjet_manifest,
         } = options;
         let cache_dir = match cache_dir_arg {
             Some(path) => path,
@@ -8003,6 +8271,8 @@ async fn main() {
             &cache_dir,
             verify_snapshots,
             horizon_output,
+            ggjet_output,
+            ggjet_manifest,
             shutdown,
             cursor,
             restart_tracker,
@@ -8027,6 +8297,8 @@ async fn main() {
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
     let mut horizon_output: Option<PathBuf> = None;
+    let mut ggjet_output: Option<PathBuf> = None;
+    let mut ggjet_manifest: Option<PathBuf> = None;
     // Internal flags set by the range supervisor when spawning per-epoch
     // children: pre-fetched snapshot hashes (so the child never touches
     // gcloud) and the overall range for the child's overall-progress line.
@@ -8039,6 +8311,10 @@ async fn main() {
             verify_snapshots = false;
         } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
             horizon_output = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--ggjet-output=") {
+            ggjet_output = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--ggjet-manifest=") {
+            ggjet_manifest = Some(PathBuf::from(path));
         } else if let Some(path) = arg.strip_prefix("--epoch-hashes=") {
             epoch_hashes = Some(PathBuf::from(path));
         } else if let Some(spec) = arg.strip_prefix("--range-info=") {
@@ -8088,7 +8364,40 @@ async fn main() {
         eprintln!("--epoch-hashes applies only to a single-epoch (child) invocation");
         exit(2);
     }
+    if ggjet_output.is_some() && ggjet_manifest.is_none() {
+        eprintln!("--ggjet-output requires --ggjet-manifest=PATH");
+        exit(2);
+    }
+    if ggjet_output.is_some() && start_epoch != end_epoch {
+        eprintln!("--ggjet-output cannot be used with an epoch range");
+        exit(2);
+    }
+    if ggjet_manifest.is_some() && ggjet_output.is_none() {
+        eprintln!("--ggjet-manifest requires --ggjet-output=PATH");
+        exit(2);
+    }
+    if let Some(path) = ggjet_manifest.as_ref() {
+        match jetstreamer_horizon::ggjet::AccountManifest::load(path) {
+            Ok(manifest) => info!(
+                "ggjet manifest preflight complete: accounts={} digest={}",
+                manifest.len(),
+                manifest
+                    .digest()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+            Err(err) => {
+                eprintln!(
+                    "error: failed to validate ggjet manifest {}: {err}",
+                    path.display()
+                );
+                exit(2);
+            }
+        }
+    }
     let horizon_output_override = horizon_output;
+    let ggjet_output_override = ggjet_output;
 
     // Epoch-level resume for ranges: if an earlier run already finalized some
     // leading epochs (their `.jet` has a valid footer), skip them and restart at
@@ -8412,6 +8721,7 @@ async fn main() {
         let horizon_output = horizon_output_override
             .clone()
             .unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
+        let epoch_ggjet_output = ggjet_output_override.clone();
 
         let snapshot_verifier = if verify_snapshots {
             let expected = snapshot_expectations.remove(&epoch).unwrap_or_default();
@@ -8435,6 +8745,8 @@ async fn main() {
                 end_inclusive: target_end_inclusive,
                 horizon_output: Some(horizon_output),
                 horizon_file_mode: horizon::ArchiveFileMode::Truncate,
+                ggjet_output: epoch_ggjet_output,
+                ggjet_manifest: ggjet_manifest.clone(),
                 use_dir_loader: env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
             },
             &dest_dir,
@@ -8462,14 +8774,19 @@ async fn main() {
 mod scheduler_tests {
     use super::{
         BANK_SNAPSHOTS_DIR, EntryAccounts, ReadyEntry, ReadyQueueMessage,
-        SNAPSHOT_STATUS_CACHE_FILE, SNAPSHOT_VERSION_FILE, SlotReplayRange, assign_rounds,
-        create_disposable_bank_snapshot, parse_slot_replay_options, parse_slot_replay_range,
-        receive_ready_batch,
+        SNAPSHOT_STATUS_CACHE_FILE, SNAPSHOT_VERSION_FILE, SlotReplayRange, apply_root_transition,
+        assign_rounds, create_disposable_bank_snapshot, parse_slot_replay_options,
+        parse_slot_replay_range, receive_ready_batch,
     };
     use solana_address::Address;
     use solana_hash::Hash;
-    use solana_runtime::snapshot_utils;
-    use std::{collections::HashSet, fs};
+    use solana_runtime::{
+        bank::{Bank, SlotLeader},
+        bank_forks::BankForks,
+        genesis_utils::create_genesis_config,
+        snapshot_utils,
+    };
+    use std::{collections::HashSet, fs, sync::Arc};
 
     fn addr(byte: u8) -> Address {
         Address::new_from_array([byte; 32])
@@ -8480,6 +8797,39 @@ mod scheduler_tests {
             writes: writes.iter().map(|&b| addr(b)).collect(),
             reads: reads.iter().map(|&b| addr(b)).collect(),
         }
+    }
+
+    #[test]
+    fn program_cache_prune_precedes_bank_forks_root_transition() {
+        let genesis = create_genesis_config(10_000);
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis.genesis_config));
+        let bank0 = bank_forks.read().unwrap().working_bank();
+        bank0.freeze();
+        let child1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+        let bank1 = bank_forks
+            .write()
+            .unwrap()
+            .insert(child1)
+            .clone_without_scheduler();
+        bank1.freeze();
+        let child2 = Bank::new_from_parent(Arc::clone(&bank1), SlotLeader::default(), 2);
+        bank_forks.write().unwrap().insert(child2);
+
+        let mut guard = bank_forks.write().unwrap();
+        let mut observed_prune_before_root = false;
+        apply_root_transition(
+            &mut *guard,
+            |forks| bank1.prune_program_cache(forks),
+            |forks| {
+                assert_eq!(forks.root(), 0, "set_root ran before cache prune completed");
+                observed_prune_before_root = true;
+            },
+            |forks| {
+                forks.set_root(1, None, None);
+            },
+        );
+        assert!(observed_prune_before_root);
+        assert_eq!(guard.root(), 1);
     }
 
     #[test]
@@ -8522,6 +8872,25 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn parses_paired_ggjet_output() {
+        let options = parse_slot_replay_options(
+            [
+                "/tmp/replay-cache",
+                "--horizon-output=/tmp/range.jet",
+                "--ggjet-output=/tmp/range.ggjet",
+                "--ggjet-manifest=/tmp/accounts.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(options.ggjet_output, Some("/tmp/range.ggjet".into()));
+        assert_eq!(options.ggjet_manifest, Some("/tmp/accounts.json".into()));
+    }
+
+    #[test]
     fn rejects_invalid_slot_replay_horizon_output_options() {
         let parse = |args: &[&str]| {
             parse_slot_replay_options(args.iter().map(|arg| (*arg).to_string()), true)
@@ -8529,6 +8898,15 @@ mod scheduler_tests {
 
         assert!(parse(&["--horizon-output="]).is_err());
         assert!(parse(&["--horizon-output"]).is_err());
+        assert!(parse(&["--ggjet-output=/tmp/range.ggjet"]).is_err());
+        assert!(parse(&["--ggjet-manifest=/tmp/accounts.json"]).is_err());
+        assert!(
+            parse(&[
+                "--ggjet-output=/tmp/range.ggjet",
+                "--ggjet-manifest=/tmp/accounts.json",
+            ])
+            .is_err()
+        );
         assert!(
             parse(&[
                 "--horizon-output=/tmp/one.jet",

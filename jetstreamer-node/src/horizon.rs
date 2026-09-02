@@ -49,12 +49,17 @@ use jetstreamer_horizon::archive::{
     ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockMeta, EntryRecord, EpochMeta,
 };
 use jetstreamer_horizon::convert;
+use jetstreamer_horizon::ggjet::{
+    AccountManifest, CheckpointAccountView, GgjetStats, GgjetUpdateView, GgjetWriter,
+    GgjetWriterConfig,
+};
 use jetstreamer_horizon::transactions::Transaction;
 use log::{info, warn};
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_address::Address;
 use solana_clock::Slot;
 use solana_hash::Hash;
+use solana_runtime::bank::Bank;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -109,19 +114,26 @@ pub enum ArchiveFileMode {
     CreateNew,
 }
 
-/// Installs the active recorder for one epoch's archive. Call before that
-/// epoch's replay starts; pair with [`finish`] when it ends. Errors if a
-/// recorder is still installed (the previous epoch must be finished first).
-pub fn init(
+/// Optional selected-account archive paired with the full horizon archive.
+pub struct GgjetOutput<'a> {
+    pub path: &'a Path,
+    pub manifest_path: &'a Path,
+}
+
+/// Installs the full `.jet` recorder and, when requested, a paired `.ggjet`
+/// writer. The latter receives its checkpoint later through
+/// [`initialize_ggjet_checkpoint`], exactly when replay reaches `slot_start`.
+pub fn init_with_ggjet(
     path: &Path,
     epoch: u64,
     slot_start: Slot,
     slot_count: u64,
     presence: Arc<SlotPresenceMap>,
     file_mode: ArchiveFileMode,
+    ggjet: Option<GgjetOutput<'_>>,
 ) -> Result<(), String> {
-    let recorder = HorizonRecorder::create_with_mode(
-        path, epoch, slot_start, slot_count, presence, file_mode,
+    let recorder = HorizonRecorder::create_with_ggjet(
+        path, epoch, slot_start, slot_count, presence, file_mode, ggjet,
     )?;
     let mut slot = RECORDER
         .write()
@@ -131,6 +143,15 @@ pub fn init(
     }
     *slot = Some(Arc::new(recorder));
     Ok(())
+}
+
+/// Writes the selected-account state at `slot_start - 1`. Idempotent so the
+/// bank boundary hook can safely be reached again after a firehose restart.
+pub fn initialize_ggjet_checkpoint(bank: &Bank) -> Result<Option<GgjetStats>, String> {
+    let Some(recorder) = recorder() else {
+        return Ok(None);
+    };
+    recorder.initialize_ggjet_checkpoint(bank)
 }
 
 /// Finalizes and removes the active recorder (writes the footer + bucket
@@ -307,6 +328,7 @@ struct BufferedBlockMeta {
 
 struct RecorderState {
     writer: ArchiveWriter<BufWriter<File>>,
+    ggjet_writer: Option<GgjetWriter<BufWriter<File>>>,
     epoch: u64,
     slot_start: Slot,
     slot_end_inclusive: Slot,
@@ -334,6 +356,7 @@ pub struct HorizonRecorder {
 impl HorizonRecorder {
     /// Opens the archive file and builds a recorder for `slot_start ..
     /// slot_start + slot_count`.
+    #[cfg(test)]
     fn create_with_mode(
         path: &Path,
         epoch: u64,
@@ -341,6 +364,20 @@ impl HorizonRecorder {
         slot_count: u64,
         presence: std::sync::Arc<SlotPresenceMap>,
         file_mode: ArchiveFileMode,
+    ) -> Result<Self, String> {
+        Self::create_with_ggjet(
+            path, epoch, slot_start, slot_count, presence, file_mode, None,
+        )
+    }
+
+    fn create_with_ggjet(
+        path: &Path,
+        epoch: u64,
+        slot_start: Slot,
+        slot_count: u64,
+        presence: std::sync::Arc<SlotPresenceMap>,
+        file_mode: ArchiveFileMode,
+        ggjet: Option<GgjetOutput<'_>>,
     ) -> Result<Self, String> {
         let file = match file_mode {
             ArchiveFileMode::Truncate => File::create(path),
@@ -368,9 +405,63 @@ impl HorizonRecorder {
             ArchiveWriterConfig::default(),
         )
         .map_err(|err| format!("failed to initialize horizon archive writer: {err}"))?;
+        let ggjet_writer = if let Some(output) = ggjet {
+            let manifest = AccountManifest::load(output.manifest_path).map_err(|err| {
+                format!(
+                    "failed to load ggjet manifest {}: {err}",
+                    output.manifest_path.display()
+                )
+            })?;
+            let file = match file_mode {
+                ArchiveFileMode::Truncate => File::create(output.path),
+                ArchiveFileMode::CreateNew => OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(output.path),
+            }
+            .map_err(|err| {
+                if file_mode == ArchiveFileMode::CreateNew
+                    && err.kind() == std::io::ErrorKind::AlreadyExists
+                {
+                    format!(
+                        "refusing to overwrite existing ggjet archive {}",
+                        output.path.display()
+                    )
+                } else {
+                    format!(
+                        "failed to create ggjet archive {}: {err}",
+                        output.path.display()
+                    )
+                }
+            })?;
+            let manifest_len = manifest.len();
+            let digest = manifest.digest();
+            let writer = GgjetWriter::new(
+                BufWriter::with_capacity(8 << 20, file),
+                manifest,
+                slot_start.saturating_sub(1),
+                slot_start,
+                slot_count,
+                GgjetWriterConfig::default(),
+            )
+            .map_err(|err| format!("failed to initialize ggjet writer: {err}"))?;
+            info!(
+                "ggjet archive initialized: path={} accounts={} digest={} checkpoint_slot={} updates={}..={}",
+                output.path.display(),
+                manifest_len,
+                hex_digest(&digest),
+                slot_start.saturating_sub(1),
+                slot_start,
+                slot_start.saturating_add(slot_count).saturating_sub(1),
+            );
+            Some(writer)
+        } else {
+            None
+        };
         Ok(HorizonRecorder {
             state: Mutex::new(RecorderState {
                 writer,
+                ggjet_writer,
                 epoch,
                 slot_start,
                 slot_end_inclusive: slot_start + slot_count - 1,
@@ -386,6 +477,76 @@ impl HorizonRecorder {
                 finished: false,
             }),
         })
+    }
+
+    fn initialize_ggjet_checkpoint(&self, bank: &Bank) -> Result<Option<GgjetStats>, String> {
+        const LOG_EVERY: u64 = 25_000;
+        let start = std::time::Instant::now();
+        let mut state = self.lock();
+        let Some(writer) = state.ggjet_writer.as_mut() else {
+            return Ok(None);
+        };
+        if writer.stats().checkpoint_accounts == writer.header().account_count {
+            return Ok(Some(*writer.stats()));
+        }
+        if writer.stats().checkpoint_accounts != 0 {
+            return Err(format!(
+                "ggjet checkpoint is partially initialized ({}/{})",
+                writer.stats().checkpoint_accounts,
+                writer.header().account_count
+            ));
+        }
+
+        let checkpoint_slot = writer.header().checkpoint_slot;
+        let accounts = writer.manifest().accounts().to_vec();
+        info!(
+            "ggjet checkpoint capture starting: checkpoint_slot={} bank_slot={} accounts={}",
+            checkpoint_slot,
+            bank.slot(),
+            accounts.len()
+        );
+        for (ordinal, address) in accounts.iter().enumerate() {
+            let pubkey = solana_pubkey::Pubkey::new_from_array(address.to_bytes());
+            match bank.get_account_modified_slot(&pubkey) {
+                Some((account, last_modified_slot)) => writer
+                    .write_checkpoint_account(Some(CheckpointAccountView {
+                        last_modified_slot,
+                        lamports: account.lamports(),
+                        owner: Address::new_from_array(account.owner().to_bytes()),
+                        executable: account.executable(),
+                        rent_epoch: account.rent_epoch(),
+                        data: account.data(),
+                    }))
+                    .map_err(|err| format!("ggjet checkpoint write failed: {err}"))?,
+                None => writer
+                    .write_checkpoint_account(None)
+                    .map_err(|err| format!("ggjet checkpoint write failed: {err}"))?,
+            }
+            let done = ordinal as u64 + 1;
+            if done.is_multiple_of(LOG_EVERY) || done == accounts.len() as u64 {
+                info!(
+                    "ggjet checkpoint progress: {}/{} ({:.1}%) present={} data={} elapsed={:.1}s",
+                    done,
+                    accounts.len(),
+                    done as f64 * 100.0 / accounts.len().max(1) as f64,
+                    writer.stats().checkpoint_present,
+                    format_bytes(writer.stats().checkpoint_data_bytes),
+                    start.elapsed().as_secs_f64(),
+                );
+            }
+        }
+        writer
+            .finish_checkpoint()
+            .map_err(|err| format!("ggjet checkpoint finalization failed: {err}"))?;
+        let stats = *writer.stats();
+        info!(
+            "ggjet checkpoint complete: accounts={} present={} data={} elapsed={:.3}s",
+            stats.checkpoint_accounts,
+            stats.checkpoint_present,
+            format_bytes(stats.checkpoint_data_bytes),
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(Some(stats))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RecorderState> {
@@ -592,6 +753,11 @@ impl HorizonRecorder {
             state.writer.write_skipped_slot(slot).map_err(|err| {
                 format!("horizon: failed to write trailing skipped slot {slot}: {err}")
             })?;
+            if let Some(writer) = state.ggjet_writer.as_mut() {
+                writer
+                    .write_slot_updates(slot, &mut [])
+                    .map_err(|err| format!("ggjet: failed to write empty slot {slot}: {err}"))?;
+            }
         }
         state.finished = true;
         if !state.block_metas.is_empty() {
@@ -621,6 +787,24 @@ impl HorizonRecorder {
             .map_err(|err| format!("horizon: failed to finalize archive: {err}"))?;
         sink.into_inner()
             .map_err(|err| format!("horizon: failed to flush archive: {err}"))?;
+        if let Some(ggjet_writer) = state.ggjet_writer.take() {
+            let (sink, ggstats) = ggjet_writer
+                .finish()
+                .map_err(|err| format!("ggjet: failed to finalize archive: {err}"))?;
+            sink.into_inner()
+                .map_err(|err| format!("ggjet: failed to flush archive: {err}"))?;
+            info!(
+                "ggjet archive complete: checkpoint_accounts={} checkpoint_present={} slots={} updates={} buckets={} bytes={} checkpoint_data={} update_data={}",
+                ggstats.checkpoint_accounts,
+                ggstats.checkpoint_present,
+                ggstats.slots,
+                ggstats.updates,
+                ggstats.buckets,
+                ggstats.bytes_written,
+                ggstats.checkpoint_data_bytes,
+                ggstats.update_data_bytes,
+            );
+        }
         info!(
             "horizon archive complete: slots={} blocks={} txs={} tx_updates={} orphan_updates={} \
              epochs={} buckets={} bytes={} (payload {} uncompressed)",
@@ -707,11 +891,63 @@ impl RecorderState {
                 .unwrap_or_else(|err| {
                     panic!("horizon: failed to write skipped slot {gap_slot}: {err}")
                 });
+            if let Some(writer) = self.ggjet_writer.as_mut() {
+                writer
+                    .write_slot_updates(gap_slot, &mut [])
+                    .unwrap_or_else(|err| {
+                        panic!("ggjet: failed to write empty slot {gap_slot}: {err}")
+                    });
+            }
         }
 
         let block_meta = self.block_metas.remove(&slot).unwrap_or_else(|| {
             panic!("horizon: no block metadata buffered for replayed slot {slot}")
         });
+
+        // The selected-account stream is independent of transaction grouping.
+        // Gather references in true replay order, then let the writer impose
+        // the authoritative `(slot, write_version)` ordering.
+        if let Some(writer) = self.ggjet_writer.as_mut() {
+            let mut selected = Vec::new();
+            selected.extend(
+                assembly
+                    .pre_orphans
+                    .iter()
+                    .filter(|update| writer.manifest().contains(&update.pubkey)),
+            );
+            for committed in &assembly.txs {
+                if let Some(signature) = committed.tx.signatures.first()
+                    && let Some(updates) = assembly.tx_updates.get(signature)
+                {
+                    selected.extend(
+                        updates
+                            .iter()
+                            .filter(|update| writer.manifest().contains(&update.pubkey)),
+                    );
+                }
+            }
+            selected.extend(
+                assembly
+                    .post_orphans
+                    .iter()
+                    .filter(|update| writer.manifest().contains(&update.pubkey)),
+            );
+            let mut views = selected
+                .into_iter()
+                .map(|update| GgjetUpdateView {
+                    pubkey: update.pubkey,
+                    write_version: update.write_version,
+                    lamports: update.lamports,
+                    owner: update.owner,
+                    executable: update.executable,
+                    rent_epoch: update.rent_epoch,
+                    data: &update.data,
+                })
+                .collect::<Vec<_>>();
+            writer
+                .write_slot_updates(slot, &mut views)
+                .unwrap_or_else(|err| panic!("ggjet: failed to write slot {slot}: {err}"));
+        }
 
         self.writer
             .begin_slot(slot)
@@ -835,6 +1071,25 @@ impl RecorderState {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.last_emitted = Some(slot);
+    }
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -1000,15 +1255,50 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.jet");
-        let recorder = HorizonRecorder::create_with_mode(
+        let ggjet_path = dir.path().join("test.ggjet");
+        let manifest_path = dir.path().join("accounts.json");
+        let mut manifest_entries = [pk(1).to_string(), pk(10).to_string()];
+        manifest_entries.sort();
+        let manifest_addresses = manifest_entries
+            .iter()
+            .map(|text| Address::from_str(text).unwrap())
+            .collect::<Vec<_>>();
+        let digest = AccountManifest::from_accounts(manifest_addresses)
+            .unwrap()
+            .digest();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "accountCount": manifest_entries.len(),
+                "accountSetSha256": hex_digest(&digest),
+                "accounts": manifest_entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let recorder = HorizonRecorder::create_with_ggjet(
             &path,
             42,
             100,
             10,
             presence,
             ArchiveFileMode::Truncate,
+            Some(GgjetOutput {
+                path: &ggjet_path,
+                manifest_path: &manifest_path,
+            }),
         )
         .expect("create recorder");
+        {
+            // The production boundary hook fills these from the Bank. This
+            // recorder test uses explicit absence to isolate update routing.
+            let mut state = recorder.lock();
+            let writer = state.ggjet_writer.as_mut().unwrap();
+            writer.write_checkpoint_account(None).unwrap();
+            writer.write_checkpoint_account(None).unwrap();
+            writer.finish_checkpoint().unwrap();
+        }
 
         let bh_100 = solana_hash::Hash::new_unique();
         let bh_105 = solana_hash::Hash::new_unique();
@@ -1128,6 +1418,47 @@ mod tests {
         let (slot, tx_index, sig, _, updates) = &collected.txs[2];
         assert_eq!((*slot, *tx_index, *sig), (105, 0, sig3));
         assert_eq!(updates[0].2, b"gamma".to_vec());
+
+        #[derive(Default)]
+        struct SelectedUpdates(Vec<(Slot, Address, u64, Vec<u8>)>);
+        impl jetstreamer_horizon::ggjet::GgjetVisitor for SelectedUpdates {
+            fn on_update(
+                &mut self,
+                slot: u64,
+                update: jetstreamer_horizon::ggjet::GgjetUpdateView<'_>,
+            ) {
+                self.0.push((
+                    slot,
+                    update.pubkey,
+                    update.write_version,
+                    update.data.to_vec(),
+                ));
+            }
+        }
+        let ggjet_bytes = std::fs::read(&ggjet_path).expect("read ggjet");
+        let mut ggjet =
+            jetstreamer_horizon::ggjet::GgjetReader::open(std::io::Cursor::new(ggjet_bytes))
+                .expect("open ggjet");
+        let mut selected = SelectedUpdates::default();
+        assert_eq!(ggjet.visit_slots(100, 10, &mut selected).unwrap(), 10);
+        assert_eq!(
+            selected.0,
+            vec![
+                (
+                    100,
+                    Address::new_from_array([10; 32]),
+                    1,
+                    b"sysvar".to_vec()
+                ),
+                (100, Address::new_from_array([1; 32]), 2, b"alpha".to_vec()),
+                (
+                    105,
+                    Address::new_from_array([10; 32]),
+                    5,
+                    b"sysvar2".to_vec()
+                ),
+            ]
+        );
     }
 
     /// A gap slot that old-faithful says has a block must abort the run

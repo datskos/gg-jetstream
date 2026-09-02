@@ -16,3 +16,4 @@ compact-indexes/
 genesis.bin
 genesis.tar.bz2
 *.jet
+*.ggjet

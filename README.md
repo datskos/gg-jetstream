@@ -112,16 +112,22 @@ This example replays 1,000 inclusive slots using the binary installed under
 ```bash
 ulimit -S -n 524288
 
-JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false \
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true \
+JETSTREAMER_ROOT_INTERVAL=1024 \
   /home/ubuntu/gg-jetstream/jetstreamer-node \
     replay-slots 441851484:441852483 \
     /home/ubuntu/jetstreamer_replay_scratch \
     --no-verify
 ```
 
-`JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false` disables automatic removal of mutable AccountsDB
-paths at startup. The top-level snapshot archive is not one of those paths, but disabling cleanup
-is the conservative choice when preserving a prepared remote replay cache.
+`JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true` is the default and is the safe choice for a fresh run.
+It removes mutable AccountsDB paths left by an earlier completed or interrupted replay, while
+preserving the top-level snapshot archive, genesis, compact indexes, completed archives, and the
+pristine snapshot extraction cache. Set it to `false` only when deliberately continuing with an
+AccountsDB workspace known to be clean and compatible.
+
+`JETSTREAMER_ROOT_INTERVAL=1024` bounds the number of live replay Banks and avoids accumulating
+program-cache assignment work across a long range.
 
 `--no-verify` avoids the GCS checkpoint lookup and therefore works without Google Cloud
 credentials when the snapshot and genesis have already been staged locally. It skips comparison
@@ -137,7 +143,8 @@ path to `replay-slots`:
 ```bash
 ulimit -S -n 524288
 
-JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false \
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true \
+JETSTREAMER_ROOT_INTERVAL=1024 \
   /home/ubuntu/gg-jetstream/jetstreamer-node \
     replay-slots 441851484:441852483 \
     /home/ubuntu/jetstreamer_replay_scratch \
@@ -191,6 +198,109 @@ cargo run --release -p jetstreamer-horizon --example verify_archive -- \
 
 The first line includes the archive header's `epoch`, `slot_start`, and `slot_count`. Use that
 header epoch when importing; a ten-slot archive is still associated with its containing epoch.
+
+#### Write a selected-account `.ggjet` archive
+
+`.ggjet` requires a normalized, deterministic account manifest. It does not accept the original
+arb catalog whose top-level `entries` object contains `requiredAccounts`. The normalized manifest
+has top-level `accountCount`, `accountSetSha256`, and a unique, strictly sorted `accounts` array.
+
+Create it once from the source catalog. The builder takes the strict union of only
+`entries.*.requiredAccounts`, validates every value as a 32-byte base58 pubkey, and refuses to
+overwrite an existing output:
+
+```bash
+python3 /home/ubuntu/gg-jetstream/scripts/build_ggjet_manifest.py \
+  /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.json \
+  /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+```
+
+Before starting a long replay, confirm that the normalized manifest—not the source catalog—is at
+the path that will be passed to the node:
+
+```bash
+wc -c /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+sha256sum /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+grep -m1 '"accountCount"' \
+  /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+grep -m1 '"accountSetSha256"' \
+  /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+```
+
+For the current arb account set, the expected values are:
+
+```text
+20294297 bytes
+file SHA-256:        39909dfc2f3fc21bc4407b8dc6ebe24f1d0d2f60460376368f1c7e746ce0063f
+accountCount:        390696
+accountSetSha256:    07f5c5e50de7a2d32b488824effab2d86b9120cc3d9b451904a24556d8f67f17
+```
+
+The file SHA-256 covers the JSON file; `accountSetSha256` covers the concatenated raw 32-byte
+pubkeys. Once the preflight values match, the following clean 10,000-slot replay produces both
+archives in one execution:
+
+```bash
+ulimit -S -n 524288
+
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true \
+JETSTREAMER_ROOT_INTERVAL=1024 \
+JETSTREAMER_LOG_FILE=/home/ubuntu/jetstreamer_replay_scratch/replay-both.log \
+  /home/ubuntu/gg-jetstream/jetstreamer-node \
+    replay-slots 441851484:441861483 \
+    /home/ubuntu/jetstreamer_replay_scratch \
+    --no-verify \
+    --horizon-output=/home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483-both.jet \
+    --ggjet-output=/home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483-both.ggjet \
+    --ggjet-manifest=/home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+```
+
+Both output paths must be absent before launch; Jetstreamer never overwrites an archive. Manifest
+validation and output-path checks happen before the expensive snapshot load. The checkpoint is
+captured from the frozen Bank at slot `441851483`, immediately before the requested range. Every
+manifest account is represented, including accounts absent at the checkpoint. All matching
+updates—including zero-lamport writes and repeated writes to one account—are stored in
+`(slot, write_version)` order. On success, the `.jet` and `.ggjet` both cover
+`441851484..=441861483`.
+
+Follow the dedicated run log from another shell:
+
+```bash
+tail -f /home/ubuntu/jetstreamer_replay_scratch/replay-both.log
+```
+
+After the replay succeeds, validate the selected-account archive:
+
+```bash
+/home/ubuntu/gg-jetstream/jetstreamer-node verify-ggjet \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483-both.ggjet
+```
+
+An already-completed `.jet` can be converted without executing its transactions again when an
+exact `START - 1` snapshot is available:
+
+```bash
+/home/ubuntu/gg-jetstream/jetstreamer-node ggjet-from-jet \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483.jet \
+  /home/ubuntu/jetstreamer_replay_scratch/snapshot-441851483-9Wfwu7Qtw9vLQDUmbzE7LsQP7B1qP7a4bKMCp63S8nFd.tar.zst \
+  /home/ubuntu/jetstreamer_replay_scratch \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483.ggjet \
+  /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+```
+
+The converter rejects an older or newer snapshot rather than producing a checkpoint for the
+wrong slot. It validates the manifest before loading the Bank or creating the output file. It then
+loads the snapshot Bank, writes the checkpoint, and decodes/filter-copies account updates from
+`.jet`; it does not replay transactions. Validate every checksum and fully decode the checkpoint
+and update stream afterward:
+
+```bash
+/home/ubuntu/gg-jetstream/jetstreamer-node verify-ggjet \
+  /home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483.ggjet
+```
+
+The v1 wire format and reconstruction invariants are documented in
+[`docs/ggjet.md`](docs/ggjet.md).
 
 #### Load a `.jet` archive into ClickHouse
 
