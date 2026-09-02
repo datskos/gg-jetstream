@@ -86,6 +86,7 @@ use xxhash_rust::xxh64::xxh64;
 
 mod horizon;
 mod plugin;
+mod snapshot_accounts_csv;
 
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
 const SNAPSHOT_UNPACK_LOG_INTERVAL_SECS: u64 = 5;
@@ -4535,6 +4536,7 @@ fn usage(program: &str) -> String {
          {program} replay-slots START:END [cache-dir] [--verify|--no-verify] \
          [--horizon-output=PATH] [--ggjet-output=PATH --ggjet-manifest=PATH]\n\
          {program} ggjet-from-jet JET SNAPSHOT CACHE-DIR OUTPUT MANIFEST\n\
+         {program} snapshot-accounts-csv SNAPSHOT CACHE-DIR OUTPUT.csv\n\
          {program} verify-ggjet PATH\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
@@ -4551,6 +4553,10 @@ fn usage(program: &str) -> String {
          JETSTREAMER_EPOCH_ATTEMPTS (default 2) bounds retries of a crashed epoch;\n\
          JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS=0 keeps each boundary snapshot archive\n\
          after its epoch finalizes (default: deleted to reclaim disk).\n\
+         snapshot-accounts-csv restores SNAPSHOT directly and scans its Bank; it does\n\
+         not download or replay transactions. AccountsIndex bins are scanned in\n\
+         parallel; JETSTREAMER_SNAPSHOT_CSV_THREADS controls the worker count\n\
+         (default: available CPUs, capped at 32). Zero-lamport tombstones are excluded.\n\
          --horizon-output applies to a single epoch or one replay-slots range.\n\
          --epoch-hashes=PATH and --range-info=A-B are internal flags passed by the\n\
          range supervisor to its per-epoch children."
@@ -7873,6 +7879,85 @@ async fn run_ggjet_from_jet_command(
     Ok(())
 }
 
+async fn run_snapshot_accounts_csv_command(
+    snapshot_path: &Path,
+    cache_dir: &Path,
+    output_path: &Path,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    snapshot_accounts_csv::prepare_snapshot_accounts_csv_output(output_path)?;
+    let worker_threads = snapshot_accounts_csv::snapshot_accounts_csv_worker_threads()?;
+    let snapshot_info = FullSnapshotArchiveInfo::new_from_path(snapshot_path.to_path_buf())
+        .map_err(|error| {
+            format!(
+                "failed to parse snapshot archive {}: {error}",
+                snapshot_path.display()
+            )
+        })?;
+    let snapshot_slot = snapshot_info.slot();
+
+    fs::create_dir_all(cache_dir).map_err(|error| {
+        format!(
+            "failed to create snapshot account CSV cache {}: {error}",
+            cache_dir.display()
+        )
+    })?;
+    ensure_genesis_archive(cache_dir).await?;
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+        clear_ledger_accounts_state(cache_dir)?;
+    } else {
+        info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
+    }
+
+    let cache_dir_owned = cache_dir.to_path_buf();
+    let snapshot_path_owned = snapshot_path.to_path_buf();
+    let output_path_owned = output_path.to_path_buf();
+    info!(
+        "loading snapshot Bank for account CSV: slot={} path={}",
+        snapshot_slot,
+        snapshot_path_owned.display()
+    );
+    let stats = tokio::task::spawn_blocking(move || {
+        let bank = load_bank_from_snapshot_archive(&cache_dir_owned, &snapshot_path_owned, None)?;
+        if bank.slot() != snapshot_slot {
+            return Err(format!(
+                "loaded Bank is at slot {}, expected snapshot slot {snapshot_slot}",
+                bank.slot()
+            ));
+        }
+        info!(
+            "snapshot account CSV scan starting: bank_slot={} workers={} output={}",
+            bank.slot(),
+            worker_threads,
+            output_path_owned.display()
+        );
+        snapshot_accounts_csv::export_snapshot_accounts_csv(
+            &bank,
+            &output_path_owned,
+            worker_threads,
+            shutdown.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("snapshot account CSV task failed: {error}"))??;
+
+    let completion = format!(
+        "snapshot account CSV complete: snapshot_slot={} accounts={} data_bytes={} lamports={} \
+         zero_lamport_skipped={} non_live_index_entries={} output_bytes={} output={}",
+        snapshot_slot,
+        stats.accounts,
+        stats.data_bytes,
+        stats.lamports,
+        stats.skipped_zero_lamport,
+        stats.non_live_index_entries,
+        stats.output_bytes,
+        output_path.display(),
+    );
+    println!("{completion}");
+    append_raw_log_line(&completion);
+    Ok(())
+}
+
 fn run_verify_ggjet_command(path: &Path) -> Result<(), String> {
     use jetstreamer_horizon::ggjet::{
         CheckpointAccountView, GgjetReader, GgjetUpdateView, GgjetVisitor,
@@ -8168,6 +8253,34 @@ async fn main() {
 
     if epoch_arg == "-h" || epoch_arg == "--help" {
         println!("{}", usage(&program));
+        return;
+    }
+
+    if epoch_arg == "snapshot-accounts-csv" {
+        let values = args.collect::<Vec<_>>();
+        if values.len() != 3 {
+            eprintln!("snapshot-accounts-csv requires SNAPSHOT CACHE-DIR OUTPUT.csv");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        }
+        let snapshot_path = PathBuf::from(&values[0]);
+        let cache_dir = PathBuf::from(&values[1]);
+        let output_path = PathBuf::from(&values[2]);
+        if let Err(error) = enable_file_logging(&cache_dir) {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+        if let Err(error) = run_snapshot_accounts_csv_command(
+            &snapshot_path,
+            &cache_dir,
+            &output_path,
+            shutdown.clone(),
+        )
+        .await
+        {
+            eprintln!("error: {error}");
+            exit(1);
+        }
         return;
     }
 

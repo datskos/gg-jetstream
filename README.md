@@ -104,6 +104,75 @@ first requested slot. Keep the snapshot archive directly in the cache directory,
 `genesis.tar.bz2` can be used instead of `genesis.bin`. The genesis and snapshot must be compatible
 with the Agave version used to build `jetstreamer-node`.
 
+#### Export every live snapshot account to CSV
+
+`snapshot-accounts-csv` loads a full snapshot and streams the latest live version of every pubkey
+visible at that Bank into a CSV. It excludes zero-lamport tombstones and does not write account
+data, only its byte length. The CSV columns are exactly:
+
+```text
+pubkey,owner,data_size,lamports
+```
+
+For the slot 443752621 snapshot:
+
+```bash
+ulimit -S -n 524288
+
+JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true \
+JETSTREAMER_SNAPSHOT_CSV_THREADS=32 \
+JETSTREAMER_LOG_FILE=/home/ubuntu/jetstreamer_replay_scratch/snapshot-accounts-csv.log \
+  /home/ubuntu/gg-jetstream/jetstreamer-node snapshot-accounts-csv \
+    /home/ubuntu/jetstreamer_replay_scratch/snapshot-443752621-J7uXDn8qzYc9fJ6oEwAeXFkXsG9ehThjegS2Gv6NaxzX.tar.zst \
+    /home/ubuntu/jetstreamer_replay_scratch \
+    /home/ubuntu/jetstreamer_replay_scratch/snapshot-443752621-accounts.csv
+```
+
+The cache directory must contain the matching genesis. Do not use a cache directory that another
+replay or export process is currently using: the default startup cleanup replaces its mutable
+AccountsDB state. Snapshot archives, genesis, completed archives, and the pristine extraction
+cache are preserved.
+
+The command scans the 8,192 AccountsIndex bins in parallel, resolves each pubkey's newest visible
+version, formats bounded batches in the worker threads, and feeds one streaming CSV writer. It
+does not collect the full pubkey set in memory. `JETSTREAMER_SNAPSHOT_CSV_THREADS` defaults to the
+available CPUs capped at 32; set it explicitly when benchmarking the machine. The command logs
+progress every million exported accounts, including its current accounts/second rate. On the
+reference 32-worker host, the slot 443752621 export sustained approximately 427,000–446,000 live
+accounts per second and completed in roughly 45 minutes. Its CSV was approximately 120 GB; retain
+at least 150 GB of free space for the export.
+
+`zero_lamport_skipped` counts tombstones still loadable from storage.
+`non_live_index_entries` counts index keys whose zero-lamport state has already been purged. Both
+are expected and excluded because neither represents an account that exists at the snapshot Bank.
+
+Rows follow parallel AccountsDB scan order; use `pubkey` as the key rather than relying on row
+order. The potentially large CSV is staged in its destination directory and published only after
+the complete scan flushes successfully. An existing output is never overwritten. `Ctrl+C`
+cancels the parallel scan and removes the staged partial file.
+
+Monitor the export and verify successful publication with:
+
+```bash
+grep 'snapshot account CSV progress' \
+  /home/ubuntu/jetstreamer_replay_scratch/snapshot-accounts-csv.log | tail -1
+
+grep 'snapshot account CSV complete' \
+  /home/ubuntu/jetstreamer_replay_scratch/snapshot-accounts-csv.log | tail -1
+
+head -n 2 /home/ubuntu/jetstreamer_replay_scratch/snapshot-443752621-accounts.csv
+ls -lh /home/ubuntu/jetstreamer_replay_scratch/snapshot-443752621-accounts.csv
+```
+
+The final CSV path appears only after a successful flush and sync. During the run, the output is a
+hidden `.tmp*` file in the destination directory; interrupted builds of older binaries may leave
+one behind. List candidates before removing any orphan:
+
+```bash
+find /home/ubuntu/jetstreamer_replay_scratch \
+  -maxdepth 1 -type f -name '.tmp*' -ls
+```
+
 #### Run replay
 
 This example replays 1,000 inclusive slots using the binary installed under
