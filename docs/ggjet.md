@@ -17,9 +17,11 @@ update bucket index
 footer
 ```
 
-The manifest is an ordered list of raw 32-byte pubkeys. `account_set_sha256` is SHA-256 over their
-binary concatenation in manifest order. Writers validate the JSON manifest's count, strict sort
-order, pubkeys, and digest before creating an archive. Updates refer to manifest ordinals.
+The embedded manifest is an ordered list of raw 32-byte pubkeys. `account_set_sha256` is SHA-256
+over their binary concatenation in manifest order. Writers accept either a normalized JSON
+manifest—whose count, strict sort order, pubkeys, and digest are validated—or an arb catalog, which
+is normalized from the unique union of `entries.*.requiredAccounts` before archive creation.
+Updates refer to manifest ordinals.
 
 Checkpoint buckets contain one record per manifest account in the same order. An absent account is
 encoded explicitly. A present record contains `last_modified_slot`, lamports, owner, executable,

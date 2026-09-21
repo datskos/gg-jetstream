@@ -6,7 +6,13 @@
 //! ordinal and updates are bucketed by slot, so both large writes and random
 //! reads stay bounded in memory.
 
-use std::{collections::HashMap, fs, io::SeekFrom, path::Path, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::SeekFrom,
+    path::Path,
+    str::FromStr,
+};
 
 use lencode::{
     context::{DecoderContext, EncoderContext},
@@ -87,14 +93,22 @@ pub enum GgjetError {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ManifestJson {
-    version: u32,
+struct AccountListJson {
+    version: u64,
     source: Option<String>,
     source_version: Option<u64>,
     source_generated_at_unix: Option<u64>,
-    account_count: u64,
-    account_set_sha256: String,
-    accounts: Vec<String>,
+    account_count: Option<u64>,
+    account_set_sha256: Option<String>,
+    accounts: Option<Vec<String>>,
+    generated_at_unix: Option<u64>,
+    entries: Option<HashMap<String, AccountCatalogEntryJson>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountCatalogEntryJson {
+    required_accounts: Vec<String>,
 }
 
 /// Validated deterministic account set used by both replay and conversion.
@@ -109,31 +123,85 @@ pub struct AccountManifest {
 }
 
 impl AccountManifest {
+    /// Loads either a normalized manifest or an arb account catalog. Catalogs
+    /// are normalized exactly like `scripts/build_ggjet_manifest.py`: take the
+    /// unique union of `entries.*.requiredAccounts`, sort their base58 text,
+    /// validate every address, then hash the concatenated 32-byte pubkeys.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, GgjetError> {
+        let path = path.as_ref();
         let bytes = fs::read(path)?;
-        let json: ManifestJson = serde_json::from_slice(&bytes)?;
-        if json.version != 1 {
+        let json: AccountListJson = serde_json::from_slice(&bytes)?;
+        let AccountListJson {
+            version,
+            source,
+            source_version,
+            source_generated_at_unix,
+            account_count,
+            account_set_sha256,
+            accounts,
+            generated_at_unix,
+            entries,
+        } = json;
+        if let Some(entries) = entries {
+            if account_count.is_some() || account_set_sha256.is_some() || accounts.is_some() {
+                return Err(GgjetError::Manifest(
+                    "JSON mixes arb catalog entries with normalized manifest fields".into(),
+                ));
+            }
+            return Self::from_account_catalog(version, generated_at_unix, entries, path);
+        }
+        let account_count = account_count.ok_or_else(|| {
+            GgjetError::Manifest("missing accountCount or top-level entries object".into())
+        })?;
+        let account_set_sha256 = account_set_sha256.ok_or_else(|| {
+            GgjetError::Manifest("missing accountSetSha256 or top-level entries object".into())
+        })?;
+        let accounts = accounts.ok_or_else(|| {
+            GgjetError::Manifest("missing accounts or top-level entries object".into())
+        })?;
+        Self::from_manifest_json(
+            version,
+            source,
+            source_version,
+            source_generated_at_unix,
+            account_count,
+            account_set_sha256,
+            accounts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_manifest_json(
+        version: u64,
+        source: Option<String>,
+        source_version: Option<u64>,
+        source_generated_at_unix: Option<u64>,
+        account_count: u64,
+        account_set_sha256: String,
+        account_texts: Vec<String>,
+    ) -> Result<Self, GgjetError> {
+        if version != 1 {
             return Err(GgjetError::Manifest(format!(
                 "unsupported manifest version {}",
-                json.version
+                version
             )));
         }
-        if json.account_count != json.accounts.len() as u64 {
+        if account_count != account_texts.len() as u64 {
             return Err(GgjetError::Manifest(format!(
                 "accountCount={} but accounts has {} entries",
-                json.account_count,
-                json.accounts.len()
+                account_count,
+                account_texts.len()
             )));
         }
-        if json.accounts.len() > u32::MAX as usize {
+        if account_texts.len() > u32::MAX as usize {
             return Err(GgjetError::Manifest(
                 "more than u32::MAX accounts are not supported".into(),
             ));
         }
 
-        let mut accounts = Vec::with_capacity(json.accounts.len());
+        let mut accounts = Vec::with_capacity(account_texts.len());
         let mut previous: Option<&str> = None;
-        for (ordinal, text) in json.accounts.iter().enumerate() {
+        for (ordinal, text) in account_texts.iter().enumerate() {
             if let Some(prev) = previous
                 && prev >= text.as_str()
             {
@@ -151,10 +219,10 @@ impl AccountManifest {
         }
 
         let digest = manifest_digest(&accounts);
-        let declared = decode_sha256(&json.account_set_sha256)?;
+        let declared = decode_sha256(&account_set_sha256)?;
         if digest != declared {
             return Err(GgjetError::ManifestDigest {
-                declared: json.account_set_sha256,
+                declared: account_set_sha256,
                 calculated: hex(&digest),
             });
         }
@@ -168,9 +236,56 @@ impl AccountManifest {
             accounts,
             index,
             digest,
-            source: json.source,
-            source_version: json.source_version,
-            source_generated_at_unix: json.source_generated_at_unix,
+            source,
+            source_version,
+            source_generated_at_unix,
+        })
+    }
+
+    fn from_account_catalog(
+        version: u64,
+        generated_at_unix: Option<u64>,
+        entries: HashMap<String, AccountCatalogEntryJson>,
+        path: &Path,
+    ) -> Result<Self, GgjetError> {
+        let mut unique_accounts = HashSet::new();
+        for entry in entries.into_values() {
+            unique_accounts.extend(entry.required_accounts);
+        }
+        let mut account_texts = unique_accounts.into_iter().collect::<Vec<_>>();
+        account_texts.sort_unstable();
+        if account_texts.len() > u32::MAX as usize {
+            return Err(GgjetError::Manifest(
+                "more than u32::MAX accounts are not supported".into(),
+            ));
+        }
+
+        let mut accounts = Vec::with_capacity(account_texts.len());
+        for (ordinal, text) in account_texts.iter().enumerate() {
+            let address = Address::from_str(text).map_err(|err| {
+                GgjetError::Manifest(format!(
+                    "invalid account at sorted ordinal {ordinal} ({text:?}): {err}"
+                ))
+            })?;
+            accounts.push(address);
+        }
+
+        let digest = manifest_digest(&accounts);
+        let index = accounts
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, address)| (address, i as u32))
+            .collect();
+        Ok(Self {
+            accounts,
+            index,
+            digest,
+            source: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            source_version: Some(version),
+            source_generated_at_unix: generated_at_unix,
         })
     }
 
@@ -1364,6 +1479,46 @@ mod tests {
         expected.update([1u8; 32]);
         expected.update([2u8; 32]);
         assert_eq!(manifest.digest(), <[u8; 32]>::from(expected.finalize()));
+    }
+
+    #[test]
+    fn loads_arb_catalog_as_a_deterministic_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arb_required_accounts.json");
+        let a = address(1).to_string();
+        let b = address(2).to_string();
+        let c = address(3).to_string();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 9,
+                "generatedAtUnix": 1234567890,
+                "entries": {
+                    "pool-b": { "requiredAccounts": [&c, &a] },
+                    "pool-a": { "requiredAccounts": [&b, &a] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let manifest = AccountManifest::load(&path).unwrap();
+        let mut expected_text = [a, b, c];
+        expected_text.sort();
+        let expected_accounts = expected_text
+            .iter()
+            .map(|text| Address::from_str(text).unwrap())
+            .collect::<Vec<_>>();
+        let expected_digest = manifest_digest(&expected_accounts);
+
+        assert_eq!(manifest.accounts(), expected_accounts);
+        assert_eq!(manifest.digest(), expected_digest);
+        assert_eq!(
+            manifest.source.as_deref(),
+            Some("arb_required_accounts.json")
+        );
+        assert_eq!(manifest.source_version, Some(9));
+        assert_eq!(manifest.source_generated_at_unix, Some(1234567890));
     }
 
     #[test]

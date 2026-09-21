@@ -4557,6 +4557,8 @@ fn usage(program: &str) -> String {
          not download or replay transactions. AccountsIndex bins are scanned in\n\
          parallel; JETSTREAMER_SNAPSHOT_CSV_THREADS controls the worker count\n\
          (default: available CPUs, capped at 32). Zero-lamport tombstones are excluded.\n\
+         --ggjet-manifest accepts either a normalized manifest or an arb catalog whose\n\
+         entries contain requiredAccounts; catalogs are normalized during preflight.\n\
          --horizon-output applies to a single epoch or one replay-slots range.\n\
          --epoch-hashes=PATH and --range-info=A-B are internal flags passed by the\n\
          range supervisor to its per-epoch children."

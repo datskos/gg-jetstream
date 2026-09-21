@@ -270,13 +270,13 @@ header epoch when importing; a ten-slot archive is still associated with its con
 
 #### Write a selected-account `.ggjet` archive
 
-`.ggjet` requires a normalized, deterministic account manifest. It does not accept the original
-arb catalog whose top-level `entries` object contains `requiredAccounts`. The normalized manifest
-has top-level `accountCount`, `accountSetSha256`, and a unique, strictly sorted `accounts` array.
+`.ggjet` accepts either the original arb catalog whose top-level `entries` object contains
+`requiredAccounts`, or a pre-normalized deterministic account manifest. When given a catalog, the
+node takes the strict union of only `entries.*.requiredAccounts`, sorts it, validates every value
+as a 32-byte base58 pubkey, and calculates the manifest digest before loading the snapshot.
 
-Create it once from the source catalog. The builder takes the strict union of only
-`entries.*.requiredAccounts`, validates every value as a 32-byte base58 pubkey, and refuses to
-overwrite an existing output:
+For repeated runs, the same normalization can be done once ahead of time to reduce replay startup
+work. The builder refuses to overwrite an existing output:
 
 ```bash
 python3 /home/ubuntu/gg-jetstream/scripts/build_ggjet_manifest.py \
@@ -284,8 +284,8 @@ python3 /home/ubuntu/gg-jetstream/scripts/build_ggjet_manifest.py \
   /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
 ```
 
-Before starting a long replay, confirm that the normalized manifest—not the source catalog—is at
-the path that will be passed to the node:
+The normalized form has top-level `accountCount`, `accountSetSha256`, and a unique, strictly sorted
+`accounts` array. It can be inspected before a long replay with:
 
 ```bash
 wc -c /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
@@ -296,18 +296,9 @@ grep -m1 '"accountSetSha256"' \
   /home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
 ```
 
-For the current arb account set, the expected values are:
-
-```text
-20294297 bytes
-file SHA-256:        39909dfc2f3fc21bc4407b8dc6ebe24f1d0d2f60460376368f1c7e746ce0063f
-accountCount:        390696
-accountSetSha256:    07f5c5e50de7a2d32b488824effab2d86b9120cc3d9b451904a24556d8f67f17
-```
-
 The file SHA-256 covers the JSON file; `accountSetSha256` covers the concatenated raw 32-byte
-pubkeys. Once the preflight values match, the following clean 10,000-slot replay produces both
-archives in one execution:
+pubkeys. The following clean 10,000-slot replay passes the source catalog directly and produces
+both archives in one execution:
 
 ```bash
 ulimit -S -n 524288
@@ -321,7 +312,7 @@ JETSTREAMER_LOG_FILE=/home/ubuntu/jetstreamer_replay_scratch/replay-both.log \
     --no-verify \
     --horizon-output=/home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483-both.jet \
     --ggjet-output=/home/ubuntu/jetstreamer_replay_scratch/replay-441851484-441861483-both.ggjet \
-    --ggjet-manifest=/home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.manifest.json
+    --ggjet-manifest=/home/ubuntu/gg-jetstream/data/cache/arb_required_accounts.json
 ```
 
 Both output paths must be absent before launch; Jetstreamer never overwrites an archive. Manifest
