@@ -78,6 +78,14 @@ impl Default for ProgramTrackingPlugin {
 }
 
 impl Plugin for ProgramTrackingPlugin {
+    fn wants_entries(&self) -> bool {
+        false
+    }
+
+    fn wants_rewards(&self) -> bool {
+        false
+    }
+
     #[inline(always)]
     fn name(&self) -> &'static str {
         "Program Tracking"

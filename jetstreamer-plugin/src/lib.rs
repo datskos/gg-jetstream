@@ -144,7 +144,7 @@ use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
-    BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
+    BlockData, EntryData, Handler, RewardsData, Stats, StatsTracking, TransactionData, firehose,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -178,10 +178,26 @@ pub type PluginFuture<'a> = Pin<
 
 /// Trait implemented by plugins that consume firehose events.
 ///
+/// Override [`Plugin::wants_entries`] and [`Plugin::wants_rewards`] to opt out of
+/// unused notifications. If no plugin wants a notification, the runner omits
+/// that firehose handler entirely. Built-in plugins opt out of both.
+///
 /// See the crate-level documentation for usage examples.
 pub trait Plugin: Send + Sync + 'static {
     /// Human-friendly plugin name used in logs and persisted metadata.
     fn name(&self) -> &'static str;
+
+    /// Whether to receive entry callbacks. Defaults to true for compatibility
+    /// with existing plugins that override `on_entry`. Evaluated once per run.
+    fn wants_entries(&self) -> bool {
+        true
+    }
+
+    /// Whether to receive reward callbacks. Defaults to true for compatibility
+    /// with existing plugins that override `on_reward`. Evaluated once per run.
+    fn wants_rewards(&self) -> bool {
+        true
+    }
 
     /// Semantic version for the plugin; defaults to `1`.
     fn version(&self) -> u16 {
@@ -388,7 +404,6 @@ impl PluginRunner {
                 let slots_since_flush = slots_since_flush.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                     let (transactions, tally) = worker_metrics
                         .lock()
                         .expect("worker metrics poisoned")
@@ -396,7 +411,7 @@ impl PluginRunner {
                     metrics::note_thread_transactions(thread_id, transactions);
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
-                            target: &log_target,
+                            target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                             "ignoring block while shutdown is in progress"
                         );
                         return Ok(());
@@ -411,7 +426,7 @@ impl PluginRunner {
                                 .await
                             {
                                 log::error!(
-                                    target: &log_target,
+                                    target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                     "plugin {} on_block error: {}",
                                     handle.name,
                                     err
@@ -433,7 +448,7 @@ impl PluginRunner {
                                     record_plugin_slot(db_client, handle.id, *slot).await
                                 {
                                     log::error!(
-                                        target: &log_target,
+                                        target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                         "failed to record plugin slot for {}: {}",
                                         handle.name,
                                         err
@@ -501,7 +516,6 @@ impl PluginRunner {
                 let clickhouse = clickhouse.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                     worker_metrics
                         .lock()
                         .expect("worker metrics poisoned")
@@ -511,7 +525,7 @@ impl PluginRunner {
                     }
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
-                            target: &log_target,
+                            target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                             "ignoring transaction while shutdown is in progress"
                         );
                         return Ok(());
@@ -523,7 +537,7 @@ impl PluginRunner {
                             .await
                         {
                             log::error!(
-                                target: &log_target,
+                                target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                 "plugin {} on_transaction error: {}",
                                 handle.name,
                                 err
@@ -536,87 +550,11 @@ impl PluginRunner {
             }
         };
 
-        let on_entry = {
-            let plugin_handles = plugin_handles.clone();
-            let clickhouse = clickhouse.clone();
-            let shutting_down = shutting_down.clone();
-            move |thread_id: usize, entry: EntryData| {
-                let plugin_handles = plugin_handles.clone();
-                let clickhouse = clickhouse.clone();
-                let shutting_down = shutting_down.clone();
-                async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    if plugin_handles.is_empty() {
-                        return Ok(());
-                    }
-                    if shutting_down.load(Ordering::SeqCst) {
-                        log::debug!(
-                            target: &log_target,
-                            "ignoring entry while shutdown is in progress"
-                        );
-                        return Ok(());
-                    }
-                    let entry = Arc::new(entry);
-                    for handle in plugin_handles.iter() {
-                        if let Err(err) = handle
-                            .plugin
-                            .on_entry(thread_id, clickhouse.clone(), entry.as_ref())
-                            .await
-                        {
-                            log::error!(
-                                target: &log_target,
-                                "plugin {} on_entry error: {}",
-                                handle.name,
-                                err
-                            );
-                        }
-                    }
-                    Ok(())
-                }
-                .boxed()
-            }
-        };
+        let on_entry =
+            make_entry_handler(&plugin_handles, clickhouse.clone(), shutting_down.clone());
 
-        let on_reward = {
-            let plugin_handles = plugin_handles.clone();
-            let clickhouse = clickhouse.clone();
-            let shutting_down = shutting_down.clone();
-            move |thread_id: usize, reward: RewardsData| {
-                let plugin_handles = plugin_handles.clone();
-                let clickhouse = clickhouse.clone();
-                let shutting_down = shutting_down.clone();
-                async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    if plugin_handles.is_empty() {
-                        return Ok(());
-                    }
-                    if shutting_down.load(Ordering::SeqCst) {
-                        log::debug!(
-                            target: &log_target,
-                            "ignoring reward while shutdown is in progress"
-                        );
-                        return Ok(());
-                    }
-                    let reward = Arc::new(reward);
-                    for handle in plugin_handles.iter() {
-                        if let Err(err) = handle
-                            .plugin
-                            .on_reward(thread_id, clickhouse.clone(), reward.as_ref())
-                            .await
-                        {
-                            log::error!(
-                                target: &log_target,
-                                "plugin {} on_reward error: {}",
-                                handle.name,
-                                err
-                            );
-                        }
-                    }
-                    Ok(())
-                }
-                .boxed()
-            }
-        };
+        let on_reward =
+            make_reward_handler(&plugin_handles, clickhouse.clone(), shutting_down.clone());
 
         let on_error = {
             let plugin_handles = plugin_handles.clone();
@@ -627,13 +565,12 @@ impl PluginRunner {
                 let clickhouse = clickhouse.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                     if plugin_handles.is_empty() {
                         return Ok(());
                     }
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
-                            target: &log_target,
+                            target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                             "ignoring error callback while shutdown is in progress"
                         );
                         return Ok(());
@@ -646,7 +583,7 @@ impl PluginRunner {
                             .await
                         {
                             log::error!(
-                                target: &log_target,
+                                target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                 "plugin {} on_error error: {}",
                                 handle.name,
                                 err
@@ -683,10 +620,9 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 let thread_progress_max = thread_progress_max.clone();
                 async move {
-                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                     if shutting_down.load(Ordering::SeqCst) {
                                 log::debug!(
-                                    target: &log_target,
+                                    target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                     "skipping stats write during shutdown"
                                 );
                                 return Ok(());
@@ -799,7 +735,7 @@ impl PluginRunner {
                             let txs_display = human_readable_count(stats.transactions_processed);
                             let tps_display = human_readable_count(tps.ceil() as u64);
                             log::info!(
-                                target: &log_target,
+                                target: &format!("{LOG_MODULE}::T{thread_id:03}"),
                                 "{overall_progress:.1}% | ETA: {} | {tps_display} TPS | {slots_display} slots | {blocks_display} blocks | {txs_display} txs | thread: {thread_progress:.1}%",
                                 overall_eta.unwrap_or_else(|| "n/a".into()),
                             );
@@ -822,8 +758,8 @@ impl PluginRunner {
             slot_range,
             Some(on_block),
             Some(on_transaction),
-            Some(on_entry),
-            Some(on_reward),
+            on_entry,
+            on_reward,
             Some(on_error),
             stats_tracking,
             Some(shutdown_tx.subscribe()),
@@ -1005,6 +941,100 @@ struct PluginHandle {
     version: u16,
 }
 
+fn make_entry_handler(
+    handles: &[PluginHandle],
+    clickhouse: Option<Arc<Client>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Option<impl Handler<EntryData>> {
+    let plugin_handles: Arc<Vec<_>> = Arc::new(
+        handles
+            .iter()
+            .filter(|handle| handle.plugin.wants_entries())
+            .cloned()
+            .collect(),
+    );
+    if plugin_handles.is_empty() {
+        return None;
+    }
+    Some(move |thread_id: usize, entry: EntryData| {
+        let plugin_handles = plugin_handles.clone();
+        let clickhouse = clickhouse.clone();
+        let shutting_down = shutting_down.clone();
+        async move {
+            if shutting_down.load(Ordering::SeqCst) {
+                log::debug!(
+                    target: &format!("{LOG_MODULE}::T{thread_id:03}"),
+                    "ignoring entry while shutdown is in progress"
+                );
+                return Ok(());
+            }
+            for handle in plugin_handles.iter() {
+                if let Err(err) = handle
+                    .plugin
+                    .on_entry(thread_id, clickhouse.clone(), &entry)
+                    .await
+                {
+                    log::error!(
+                        target: &format!("{LOG_MODULE}::T{thread_id:03}"),
+                        "plugin {} on_entry error: {}",
+                        handle.name,
+                        err
+                    );
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    })
+}
+
+fn make_reward_handler(
+    handles: &[PluginHandle],
+    clickhouse: Option<Arc<Client>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Option<impl Handler<RewardsData>> {
+    let plugin_handles: Arc<Vec<_>> = Arc::new(
+        handles
+            .iter()
+            .filter(|handle| handle.plugin.wants_rewards())
+            .cloned()
+            .collect(),
+    );
+    if plugin_handles.is_empty() {
+        return None;
+    }
+    Some(move |thread_id: usize, reward: RewardsData| {
+        let plugin_handles = plugin_handles.clone();
+        let clickhouse = clickhouse.clone();
+        let shutting_down = shutting_down.clone();
+        async move {
+            if shutting_down.load(Ordering::SeqCst) {
+                log::debug!(
+                    target: &format!("{LOG_MODULE}::T{thread_id:03}"),
+                    "ignoring reward while shutdown is in progress"
+                );
+                return Ok(());
+            }
+            for handle in plugin_handles.iter() {
+                if let Err(err) = handle
+                    .plugin
+                    .on_reward(thread_id, clickhouse.clone(), &reward)
+                    .await
+                {
+                    log::error!(
+                        target: &format!("{LOG_MODULE}::T{thread_id:03}"),
+                        "plugin {} on_reward error: {}",
+                        handle.name,
+                        err
+                    );
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    })
+}
+
 impl From<Arc<dyn Plugin>> for PluginHandle {
     fn from(plugin: Arc<dyn Plugin>) -> Self {
         let id = plugin.id();
@@ -1016,6 +1046,135 @@ impl From<Arc<dyn Plugin>> for PluginHandle {
             name,
             version,
         }
+    }
+}
+
+#[cfg(test)]
+mod optional_callback_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Observer {
+        entries: AtomicU64,
+        rewards: AtomicU64,
+    }
+
+    // Deliberately retain the default interests, as existing external plugins do.
+    impl Plugin for Observer {
+        fn name(&self) -> &'static str {
+            "observer"
+        }
+        fn on_entry<'a>(
+            &'a self,
+            _: usize,
+            _: Option<Arc<Client>>,
+            _: &'a EntryData,
+        ) -> PluginFuture<'a> {
+            async move {
+                self.entries.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            .boxed()
+        }
+        fn on_reward<'a>(
+            &'a self,
+            _: usize,
+            _: Option<Arc<Client>>,
+            _: &'a RewardsData,
+        ) -> PluginFuture<'a> {
+            async move {
+                self.rewards.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+
+    struct Uninterested;
+    impl Plugin for Uninterested {
+        fn name(&self) -> &'static str {
+            "uninterested"
+        }
+        fn wants_entries(&self) -> bool {
+            false
+        }
+        fn wants_rewards(&self) -> bool {
+            false
+        }
+        fn on_entry<'a>(
+            &'a self,
+            _: usize,
+            _: Option<Arc<Client>>,
+            _: &'a EntryData,
+        ) -> PluginFuture<'a> {
+            panic!("entry dispatch should be disabled")
+        }
+        fn on_reward<'a>(
+            &'a self,
+            _: usize,
+            _: Option<Arc<Client>>,
+            _: &'a RewardsData,
+        ) -> PluginFuture<'a> {
+            panic!("reward dispatch should be disabled")
+        }
+    }
+
+    #[test]
+    fn builtins_and_empty_plugin_sets_do_not_register_optional_callbacks() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(plugins::tx_metadata::TxMetadataPlugin::new()),
+            Arc::new(plugins::program_tracking::ProgramTrackingPlugin::new()),
+            Arc::new(plugins::instruction_tracking::InstructionTrackingPlugin::new()),
+            Arc::new(plugins::pubkey_stats::PubkeyStatsPlugin::new()),
+        ];
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handles: Vec<_> = plugins.into_iter().map(PluginHandle::from).collect();
+        for set in [handles.as_slice(), &[]] {
+            assert!(make_entry_handler(set, None, shutdown.clone()).is_none());
+            assert!(make_reward_handler(set, None, shutdown.clone()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_hooks_still_run_and_opted_out_hooks_are_skipped() {
+        let observer = Arc::new(Observer::default());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Uninterested), observer.clone()];
+        let handles: Vec<_> = plugins.into_iter().map(PluginHandle::from).collect();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let on_entry = make_entry_handler(&handles, None, shutdown.clone()).unwrap();
+        let on_reward = make_reward_handler(&handles, None, shutdown.clone()).unwrap();
+        let entry = || EntryData {
+            slot: 42,
+            entry_index: 0,
+            transaction_indexes: 0..1,
+            num_hashes: 1,
+            hash: solana_hash::Hash::default(),
+        };
+        on_entry(0, entry()).await.unwrap();
+        on_reward(
+            0,
+            RewardsData {
+                slot: 42,
+                rewards: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(observer.entries.load(Ordering::Relaxed), 1);
+        assert_eq!(observer.rewards.load(Ordering::Relaxed), 1);
+        shutdown.store(true, Ordering::SeqCst);
+        on_entry(0, entry()).await.unwrap();
+        on_reward(
+            0,
+            RewardsData {
+                slot: 42,
+                rewards: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(observer.entries.load(Ordering::Relaxed), 1);
+        assert_eq!(observer.rewards.load(Ordering::Relaxed), 1);
     }
 }
 

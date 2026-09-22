@@ -63,6 +63,14 @@ impl Default for InstructionTrackingPlugin {
 }
 
 impl Plugin for InstructionTrackingPlugin {
+    fn wants_entries(&self) -> bool {
+        false
+    }
+
+    fn wants_rewards(&self) -> bool {
+        false
+    }
+
     #[inline(always)]
     fn name(&self) -> &'static str {
         "Instruction Tracking"
