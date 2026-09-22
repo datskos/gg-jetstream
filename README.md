@@ -471,6 +471,12 @@ If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool usin
 hardware-aware heuristic exposed by
 `jetstreamer_firehose::system::optimal_firehose_thread_count`.
 
+The `tx-metadata` plugin combines completed blocks across workers into ClickHouse inserts
+of roughly 50,000 rows (whole blocks are kept together). Each block callback also flushes
+an existing batch if it is at least one second old; this is an arrival-driven check, not a
+background timer. Graceful shutdown flushes any remaining rows. Failed inserts retain and
+retry the same batch without copying its rows on each attempt.
+
 For sequential replay mode, enable `--sequential` (or `JETSTREAMER_SEQUENTIAL=1`). In this mode
 Jetstreamer uses a single firehose worker and reuses `JETSTREAMER_THREADS` as ripget parallel
 download concurrency:

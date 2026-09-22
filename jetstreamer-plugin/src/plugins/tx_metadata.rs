@@ -9,7 +9,8 @@
 
 mod scheduler_metrics;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ahash::RandomState;
 use clickhouse::{Client, Row};
@@ -23,6 +24,39 @@ use crate::{Plugin, PluginFuture};
 
 const BASE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
 const TX_METADATA_TABLE: &str = "tx_meta_v2";
+const INSERT_BATCH_ROWS: usize = 50_000;
+const INSERT_BATCH_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Only completed blocks enter this buffer. Age is checked on each block;
+/// shutdown flushes any remainder even if no further blocks arrive.
+#[derive(Default)]
+struct InsertBatch {
+    rows: Vec<TxMetadataRow>,
+    started: Option<Instant>,
+}
+
+impl InsertBatch {
+    fn push(&mut self, rows: Vec<TxMetadataRow>, now: Instant) -> Option<Vec<TxMetadataRow>> {
+        if !rows.is_empty() {
+            self.started.get_or_insert(now);
+            self.rows.extend(rows);
+        }
+        if self.rows.len() >= INSERT_BATCH_ROWS
+            || self
+                .started
+                .is_some_and(|started| now.duration_since(started) >= INSERT_BATCH_MAX_AGE)
+        {
+            Some(self.take())
+        } else {
+            None
+        }
+    }
+
+    fn take(&mut self) -> Vec<TxMetadataRow> {
+        self.started = None;
+        std::mem::take(&mut self.rows)
+    }
+}
 
 /// Number of slots between flushes for the horizon-native per-transaction
 /// writer. This keeps each batch bounded even though the general horizon
@@ -338,6 +372,7 @@ fn row_from_firehose(transaction: &TransactionData) -> TxMetadataRow {
 #[derive(Clone)]
 pub struct TxMetadataPlugin {
     pending: Arc<DashMap<u64, Vec<TxMetadataRow>, RandomState>>,
+    batch: Arc<Mutex<InsertBatch>>,
 }
 
 impl TxMetadataPlugin {
@@ -345,6 +380,7 @@ impl TxMetadataPlugin {
     pub fn new() -> Self {
         Self {
             pending: Arc::new(DashMap::with_hasher(RandomState::new())),
+            batch: Arc::new(Mutex::new(InsertBatch::default())),
         }
     }
 
@@ -357,7 +393,7 @@ impl TxMetadataPlugin {
 
     fn drain_all_rows(&self) -> Vec<TxMetadataRow> {
         let slots: Vec<_> = self.pending.iter().map(|entry| *entry.key()).collect();
-        let mut rows = Vec::new();
+        let mut rows = self.batch.lock().expect("insert batch poisoned").take();
         for slot in slots {
             rows.extend(self.take_slot_rows(slot));
         }
@@ -383,10 +419,8 @@ impl Plugin for TxMetadataPlugin {
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move {
-            self.pending
-                .entry(transaction.slot)
-                .or_default()
-                .push(row_from_firehose(transaction));
+            let row = row_from_firehose(transaction);
+            self.pending.entry(transaction.slot).or_default().push(row);
             Ok(())
         }
         .boxed()
@@ -400,15 +434,20 @@ impl Plugin for TxMetadataPlugin {
     ) -> PluginFuture<'_> {
         let rows = self.take_slot_rows(block.slot());
         async move {
-            if let Some(db) = db
-                && !rows.is_empty()
-            {
-                crate::spawn_tracked_write(async move {
-                    crate::retry_clickhouse_write("transaction metadata", || {
-                        write_tx_metadata_rows(Arc::clone(&db), rows.clone())
-                    })
-                    .await;
-                });
+            if let Some(db) = db {
+                let batch = self
+                    .batch
+                    .lock()
+                    .expect("insert batch poisoned")
+                    .push(rows, Instant::now());
+                if let Some(rows) = batch {
+                    crate::spawn_tracked_write(async move {
+                        crate::retry_clickhouse_write("transaction metadata", || {
+                            write_tx_metadata_rows_ref(db.as_ref(), &rows)
+                        })
+                        .await;
+                    });
+                }
             }
             Ok(())
         }
@@ -436,7 +475,7 @@ impl Plugin for TxMetadataPlugin {
                 && !rows.is_empty()
             {
                 crate::retry_clickhouse_write("transaction metadata (exit flush)", || {
-                    write_tx_metadata_rows(Arc::clone(&db), rows.clone())
+                    write_tx_metadata_rows_ref(db.as_ref(), &rows)
                 })
                 .await;
             }
@@ -505,11 +544,18 @@ pub(crate) async fn write_tx_metadata_rows(
     db: Arc<Client>,
     rows: Vec<TxMetadataRow>,
 ) -> Result<(), clickhouse::error::Error> {
+    write_tx_metadata_rows_ref(db.as_ref(), &rows).await
+}
+
+async fn write_tx_metadata_rows_ref(
+    db: &Client,
+    rows: &[TxMetadataRow],
+) -> Result<(), clickhouse::error::Error> {
     if rows.is_empty() {
         return Ok(());
     }
     let mut insert = db.insert::<TxMetadataRow>(TX_METADATA_TABLE).await?;
-    for row in &rows {
+    for row in rows {
         insert.write(row).await?;
     }
     insert.end().await
@@ -519,6 +565,111 @@ pub(crate) async fn write_tx_metadata_rows(
 mod tests {
     use super::*;
     use clickhouse::Row;
+
+    #[test]
+    fn insert_batch_combines_blocks_without_splitting_or_losing_rows() {
+        let mut batch = InsertBatch::default();
+        let now = Instant::now();
+        let rows = (0..INSERT_BATCH_ROWS + 3)
+            .map(|index| TxMetadataRow {
+                tx_idx: index as u32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        assert!(batch.push(rows[..20_000].to_vec(), now).is_none());
+        assert!(batch.push(rows[20_000..40_000].to_vec(), now).is_none());
+        let flushed = batch.push(rows[40_000..].to_vec(), now).unwrap();
+        assert_eq!(flushed, rows);
+        assert!(batch.take().is_empty());
+        assert!(batch.push(Vec::new(), now + INSERT_BATCH_MAX_AGE).is_none());
+    }
+
+    #[test]
+    fn insert_batch_age_starts_with_first_row_and_resets_after_flush() {
+        let mut batch = InsertBatch::default();
+        let now = Instant::now();
+        assert!(batch.push(Vec::new(), now).is_none());
+        let started = now + Duration::from_secs(10);
+        let row = TxMetadataRow::default();
+        assert!(batch.push(vec![row.clone()], started).is_none());
+        assert!(
+            batch
+                .push(Vec::new(), started + Duration::from_millis(999))
+                .is_none()
+        );
+        assert_eq!(
+            batch.push(Vec::new(), started + INSERT_BATCH_MAX_AGE),
+            Some(vec![row.clone()])
+        );
+        assert!(
+            batch
+                .push(vec![row], started + Duration::from_secs(20))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_workers_batch_every_row_once() {
+        let plugin = TxMetadataPlugin::new();
+        let now = Instant::now();
+        let workers = (0..8)
+            .map(|worker| {
+                let plugin = plugin.clone();
+                std::thread::spawn(move || {
+                    let mut flushed = Vec::new();
+                    for block in 0..10 {
+                        let rows = (0..1_000)
+                            .map(|tx_idx| TxMetadataRow {
+                                slot: worker * 10 + block,
+                                tx_idx,
+                                ..Default::default()
+                            })
+                            .collect();
+                        if let Some(rows) = plugin.batch.lock().unwrap().push(rows, now) {
+                            flushed.extend(rows);
+                        }
+                    }
+                    flushed
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for worker in workers {
+            rows.extend(worker.join().unwrap());
+        }
+        rows.extend(plugin.drain_all_rows());
+        let mut keys = rows
+            .into_iter()
+            .map(|row| (row.slot, row.tx_idx))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let expected = (0..80)
+            .flat_map(|slot| (0..1_000).map(move |tx_idx| (slot, tx_idx)))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn shutdown_drains_shared_batch_and_unfinished_slots_once() {
+        let plugin = TxMetadataPlugin::new();
+        let other_worker = plugin.clone();
+        let completed = TxMetadataRow {
+            slot: 10,
+            ..Default::default()
+        };
+        let unfinished = TxMetadataRow {
+            slot: 20,
+            ..Default::default()
+        };
+        other_worker
+            .batch
+            .lock()
+            .unwrap()
+            .push(vec![completed.clone()], Instant::now());
+        other_worker.pending.insert(20, vec![unfinished.clone()]);
+        assert_eq!(plugin.drain_all_rows(), vec![completed, unfinished]);
+        assert!(other_worker.drain_all_rows().is_empty());
+    }
 
     fn ix(program_id_index: u8, data: &[u8]) -> InstructionView<'_> {
         InstructionView {
