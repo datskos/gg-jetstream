@@ -894,7 +894,7 @@ fn clear_pending_skip(
 
 fn decode_transaction_status_meta_from_frame(
     slot: u64,
-    reassembled_metadata: Vec<u8>,
+    reassembled_metadata: &[u8],
     decoder: &mut utils::ZstdDecoder,
 ) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
     if reassembled_metadata.is_empty() {
@@ -902,7 +902,7 @@ fn decode_transaction_status_meta_from_frame(
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match decoder.decompress(reassembled_metadata.as_slice()) {
+    match decoder.decompress(reassembled_metadata) {
         Ok(decompressed) => decode_transaction_status_meta(slot, decompressed).map_err(|err| {
             Box::new(std::io::Error::other(format!(
                 "decode transaction metadata (slot {slot}): {err}"
@@ -911,7 +911,7 @@ fn decode_transaction_status_meta_from_frame(
         Err(decomp_err) => {
             // If the frame was not zstd-compressed (common for very early data), try to
             // decode the raw bytes directly before bailing.
-            decode_transaction_status_meta(slot, reassembled_metadata.as_slice()).map_err(|err| {
+            decode_transaction_status_meta(slot, reassembled_metadata).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "transaction metadata not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
                 ))) as SharedError
@@ -937,7 +937,7 @@ impl DecodedRewards {
 
 fn decode_rewards_from_frame(
     slot: u64,
-    reassembled_rewards: Vec<u8>,
+    reassembled_rewards: &[u8],
     decoder: &mut utils::ZstdDecoder,
 ) -> Result<DecodedRewards, SharedError> {
     if reassembled_rewards.is_empty() {
@@ -945,7 +945,7 @@ fn decode_rewards_from_frame(
         return Ok(DecodedRewards::empty());
     }
 
-    match decoder.decompress(reassembled_rewards.as_slice()) {
+    match decoder.decompress(reassembled_rewards) {
         Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed).map_err(
             |err| {
                 Box::new(std::io::Error::other(format!(
@@ -953,7 +953,7 @@ fn decode_rewards_from_frame(
                 ))) as SharedError
             },
         ),
-        Err(decomp_err) => decode_rewards_from_bytes(slot, reassembled_rewards.as_slice()).map_err(
+        Err(decomp_err) => decode_rewards_from_bytes(slot, reassembled_rewards).map_err(
             |err| {
                 Box::new(std::io::Error::other(format!(
                     "rewards not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
@@ -1113,7 +1113,7 @@ mod metadata_decode_tests {
             let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
             for frame in [compressed, raw] {
                 let decoded =
-                    decode_transaction_status_meta_from_frame(157 * 432000, frame, &mut decoder)
+                    decode_transaction_status_meta_from_frame(157 * 432000, &frame, &mut decoder)
                         .unwrap();
                 assert_eq!(decoded, meta);
             }
@@ -1135,7 +1135,7 @@ mod metadata_decode_tests {
     fn empty_frame_decodes_to_default() {
         let decoded = decode_transaction_status_meta_from_frame(
             0,
-            Vec::new(),
+            &[],
             &mut crate::utils::ZstdDecoder::default(),
         )
         .expect("decode");
@@ -1161,7 +1161,7 @@ mod metadata_decode_tests {
         let raw_bytes = bincode::serialize(&stored).expect("serialize");
         let decoded = decode_transaction_status_meta_from_frame(
             0,
-            raw_bytes,
+            &raw_bytes,
             &mut crate::utils::ZstdDecoder::default(),
         )
         .expect("decode fallback");
@@ -2092,7 +2092,7 @@ where
                                             )
                                         })?;
                                         let reassembled_metadata = nodes
-                                            .reassemble_dataframes(&tx.metadata)
+                                            .reassemble_dataframes_borrowed(&tx.metadata)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -2102,7 +2102,7 @@ where
 
                                         let as_native_metadata = decode_transaction_status_meta_from_frame(
                                             block.slot,
-                                            reassembled_metadata,
+                                            &reassembled_metadata,
                                             &mut zstd_decoder,
                                         )
                                         .map_err(|err| {
@@ -2424,7 +2424,7 @@ where
                                 Rewards(rewards) => {
                                     if reward_enabled || block_enabled {
                                         let reassembled = nodes
-                                            .reassemble_dataframes(&rewards.data)
+                                            .reassemble_dataframes_borrowed(&rewards.data)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -2455,7 +2455,7 @@ where
                                         }
 
                                         let decoded_rewards =
-                                            decode_rewards_from_frame(block.slot, reassembled, &mut zstd_decoder)
+                                            decode_rewards_from_frame(block.slot, &reassembled, &mut zstd_decoder)
                                                 .map_err(|err| {
                                                     (
                                                         FirehoseError::NodeDecodingError(
@@ -3405,11 +3405,11 @@ async fn firehose_geyser_thread(
                         match node {
                             Transaction(tx) => {
                                 let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
+                                let reassembled_metadata = nodes.reassemble_dataframes_borrowed(&tx.metadata)?;
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
-                                    reassembled_metadata,
+                                    &reassembled_metadata,
                                             &mut zstd_decoder,
                                 )?;
 
@@ -3514,11 +3514,11 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                let reassembled = nodes.reassemble_dataframes(&rewards.data)?;
+                                let reassembled = nodes.reassemble_dataframes_borrowed(&rewards.data)?;
                                 if !reassembled.is_empty() {
                                     this_block_rewards = decode_rewards_from_frame(
                                         block.slot,
-                                        reassembled,
+                                        &reassembled,
                                         &mut zstd_decoder,
                                     )?;
                                 } else {

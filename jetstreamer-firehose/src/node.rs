@@ -6,6 +6,7 @@ use {
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
+        borrow::Cow,
         collections::HashMap,
         fmt,
         io::{self, Read},
@@ -82,6 +83,23 @@ impl NodesWithCids {
         &self,
         first_dataframe: &dataframe::DataFrame,
     ) -> Result<Vec<u8>, SharedError> {
+        self.reassemble_dataframes_borrowed(first_dataframe)
+            .map(Cow::into_owned)
+    }
+
+    /// Borrows a complete frame's bytes, allocating only for continuation frames.
+    /// Both paths validate the complete payload's checksum when one is present.
+    pub fn reassemble_dataframes_borrowed<'a>(
+        &self,
+        first_dataframe: &'a dataframe::DataFrame,
+    ) -> Result<Cow<'a, [u8]>, SharedError> {
+        if first_dataframe.next.as_ref().is_none_or(Vec::is_empty) {
+            let data = first_dataframe.data.as_slice();
+            if let Some(wanted_hash) = first_dataframe.hash {
+                verify_hash(data, wanted_hash)?;
+            }
+            return Ok(Cow::Borrowed(data));
+        }
         let mut data = Vec::with_capacity(first_dataframe.data.len());
         data.extend_from_slice(first_dataframe.data.as_slice());
 
@@ -112,7 +130,7 @@ impl NodesWithCids {
         if let Some(wanted_hash) = first_dataframe.hash {
             verify_hash(&data, wanted_hash)?;
         }
-        Ok(data)
+        Ok(Cow::Owned(data))
     }
 
     /// Iterates over every node and invokes `f`.
@@ -183,6 +201,79 @@ fn checksum_fnv(data: &[u8]) -> u64 {
     let mut hasher = FnvHasher::default();
     hasher.write(data);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod reassembly_tests {
+    use super::*;
+
+    fn frame(data: &[u8], next: Option<Vec<Cid>>, hash: Option<u64>) -> dataframe::DataFrame {
+        dataframe::DataFrame {
+            kind: 6,
+            hash,
+            index: None,
+            total: None,
+            data: utils::Buffer::from_vec(data.to_vec()),
+            next,
+        }
+    }
+
+    fn cid(id: u8) -> Cid {
+        Cid::new_v1(0x71, multihash::Multihash::wrap(0x12, &[id; 32]).unwrap())
+    }
+
+    #[test]
+    fn complete_frames_borrow_bytes_and_check_both_hash_formats() {
+        let nodes = NodesWithCids::new();
+        for next in [None, Some(vec![])] {
+            for bytes in [&b"hello"[..], &b""[..]] {
+                for hash in [None, Some(checksum_crc64(bytes)), Some(checksum_fnv(bytes))] {
+                    let first = frame(bytes, next.clone(), hash);
+                    let result = nodes.reassemble_dataframes_borrowed(&first).unwrap();
+                    assert!(matches!(result, Cow::Borrowed(_)));
+                    assert_eq!(result.as_ptr(), first.data.as_slice().as_ptr());
+                    assert_eq!(result.as_ref(), bytes);
+                }
+            }
+        }
+        let bad = frame(b"hello", None, Some(checksum_crc64(b"other")));
+        assert!(nodes.reassemble_dataframes_borrowed(&bad).is_err());
+    }
+
+    #[test]
+    fn continuation_frames_are_owned_and_validate_the_complete_payload() {
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(
+            cid(1),
+            Node::DataFrame(frame(b"lo", Some(vec![cid(2)]), None)),
+        ));
+        nodes.push(NodeWithCid::new(
+            cid(2),
+            Node::DataFrame(frame(b" world", None, None)),
+        ));
+        let mut first = frame(
+            b"hel",
+            Some(vec![cid(1)]),
+            Some(checksum_crc64(b"hello world")),
+        );
+        let result = nodes.reassemble_dataframes_borrowed(&first).unwrap();
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result.as_ref(), b"hello world");
+        assert_eq!(nodes.reassemble_dataframes(&first).unwrap(), b"hello world");
+        first.hash = Some(checksum_crc64(b"wrong"));
+        assert!(nodes.reassemble_dataframes_borrowed(&first).is_err());
+    }
+
+    #[test]
+    fn missing_or_wrong_type_continuations_still_fail() {
+        let first = frame(b"hello", Some(vec![cid(1)]), None);
+        let mut nodes = NodesWithCids::new();
+        assert!(nodes.reassemble_dataframes_borrowed(&first).is_err());
+        let transaction =
+            transaction::Transaction::from_cbor(serde_cbor::Value::Array(vec![])).unwrap();
+        nodes.push(NodeWithCid::new(cid(1), Node::Transaction(transaction)));
+        assert!(nodes.reassemble_dataframes_borrowed(&first).is_err());
+    }
 }
 
 /// Unified representation of all decoded firehose node types.
