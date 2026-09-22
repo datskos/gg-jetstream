@@ -882,6 +882,94 @@ fn fetch_add_if(tracking_enabled: bool, atomic: &AtomicU64, value: u64) {
     }
 }
 
+/// Accumulates hot-path counters without shared writes per transaction. Drop
+/// publishes partial progress too, including handler errors and cancellation.
+struct TransactionMetricsBatch<'a> {
+    thread_index: usize,
+    overall: Option<&'a AtomicU64>,
+    since_stats: &'a AtomicU64,
+    count: u64,
+}
+
+impl TransactionMetricsBatch<'_> {
+    fn record(&mut self) {
+        self.count += 1;
+    }
+
+    fn publish(&mut self) {
+        let count = std::mem::take(&mut self.count);
+        if count == 0 {
+            return;
+        }
+        if let Some(overall) = self.overall {
+            overall.fetch_add(count, Ordering::Relaxed);
+        }
+        self.since_stats.fetch_add(count, Ordering::Relaxed);
+        thread_activity::add_transactions(self.thread_index, count);
+    }
+}
+
+impl Drop for TransactionMetricsBatch<'_> {
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
+#[cfg(test)]
+mod transaction_metrics_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn publishes_at_block_boundary_and_drains_partial_progress_on_drop() {
+        let overall = AtomicU64::new(0);
+        let since_stats = AtomicU64::new(0);
+        let thread_index = 999_000;
+        let before = thread_activity::tx_count(thread_index);
+        {
+            let mut batch = TransactionMetricsBatch {
+                thread_index,
+                overall: Some(&overall),
+                since_stats: &since_stats,
+                count: 0,
+            };
+            batch.record();
+            batch.record();
+            assert_eq!(overall.load(Ordering::Relaxed), 0);
+            assert_eq!(thread_activity::tx_count(thread_index), before);
+            batch.publish();
+            assert_eq!(overall.load(Ordering::Relaxed), 2);
+            batch.publish(); // Repeated flush must not double-count.
+            batch.record(); // Partial next block / error path.
+        }
+        assert_eq!(overall.load(Ordering::Relaxed), 3);
+        assert_eq!(since_stats.load(Ordering::Relaxed), 3);
+        assert_eq!(thread_activity::tx_count(thread_index), before + 3);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_worker_still_publishes_recycle_counters_without_stats() {
+        let since_stats = AtomicU64::new(0);
+        let thread_index = 999_001;
+        let before = thread_activity::tx_count(thread_index);
+        let mut worker = Box::pin(async {
+            let mut batch = TransactionMetricsBatch {
+                thread_index,
+                overall: None,
+                since_stats: &since_stats,
+                count: 0,
+            };
+            batch.record();
+            std::future::pending::<()>().await;
+        });
+        assert!(futures_util::poll!(&mut worker).is_pending());
+        drop(worker);
+        assert_eq!(since_stats.load(Ordering::Relaxed), 1);
+        assert_eq!(thread_activity::tx_count(thread_index), before + 1);
+    }
+}
+
 fn clear_pending_skip(
     map: &DashMap<usize, DashSet<u64, ahash::RandomState>, ahash::RandomState>,
     thread_id: usize,
@@ -2046,6 +2134,12 @@ where
                         let mut this_block_executed_transaction_count: u64 = 0;
                         let mut this_block_entry_count: u64 = 0;
                         let mut this_block_rewards = DecodedRewards::empty();
+                        let mut transaction_metrics = TransactionMetricsBatch {
+                            thread_index,
+                            overall: tracking_enabled.then_some(overall_transactions_processed.as_ref()),
+                            since_stats: &transactions_since_stats,
+                            count: 0,
+                        };
 
                         for node_with_cid in &nodes.0 {
                             item_index += 1;
@@ -2167,16 +2261,10 @@ where
                                             )
                                         })?;
                                     }
-                                    fetch_add_if(
-                                        tracking_enabled,
-                                        &overall_transactions_processed,
-                                        1,
-                                    );
+                                    transaction_metrics.record();
                                     if let Some(ref mut stats) = thread_stats {
                                         stats.transactions_processed += 1;
                                     }
-                                    transactions_since_stats.fetch_add(1, Ordering::Relaxed);
-                                    thread_activity::add_transactions(thread_index, 1);
                                 }
                                 Entry(entry) => {
                                     let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -2230,6 +2318,7 @@ where
                                     }
                                 }
                                 Block(block) => {
+                                    transaction_metrics.publish();
                                     let prev_last_counted_slot = last_counted_slot;
                                     let thread_stats_snapshot = thread_stats.as_ref().map(|stats| {
                                         (

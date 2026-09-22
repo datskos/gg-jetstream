@@ -106,8 +106,16 @@ pub fn note_thread_activity(thread_id: usize) {
 
 /// Records one processed transaction on `thread_id` (also stamps activity).
 pub fn note_thread_transaction(thread_id: usize) {
+    note_thread_transactions(thread_id, 1);
+}
+
+/// Publishes a worker's accumulated transaction count at a block boundary.
+pub fn note_thread_transactions(thread_id: usize, count: u64) {
     note_thread_activity(thread_id);
-    *THREAD_TX_COUNTS.entry(thread_id).or_insert(0) += 1;
+    if count != 0 {
+        let mut total = THREAD_TX_COUNTS.entry(thread_id).or_insert(0);
+        *total = total.saturating_add(count);
+    }
 }
 
 /// Total transactions processed by `thread_id` so far.
@@ -134,4 +142,26 @@ pub fn record_pulse(pulse: PulseSnapshot) {
 /// Returns the most recent stats pulse, if any.
 pub fn latest_pulse() -> Option<PulseSnapshot> {
     LATEST_PULSE.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+mod metrics_batch_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn batch_updates_preserve_totals_activity_and_run_reset() {
+        init(2);
+        assert_eq!(thread_idle_ms(0), None);
+        note_thread_transactions(0, 100);
+        note_thread_transactions(0, 200);
+        note_thread_transactions(1, 0);
+        assert_eq!(thread_tx_count(0), 300);
+        assert_eq!(thread_tx_count(1), 0);
+        assert!(thread_idle_ms(0).is_some());
+        assert!(thread_idle_ms(1).is_some());
+        init(1);
+        assert_eq!(thread_tx_count(0), 0);
+        assert_eq!(thread_idle_ms(0), None);
+    }
 }

@@ -134,7 +134,7 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -146,7 +146,6 @@ use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
 };
-use once_cell::sync::Lazy;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -366,14 +365,23 @@ impl PluginRunner {
             Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
         let clickhouse_enabled = clickhouse.is_some();
         let slots_since_flush = Arc::new(AtomicU64::new(0));
+        // Handler futures can move between runtime threads. Index by the logical
+        // firehose worker, not OS thread-local storage; each lock is worker-local.
+        let worker_metrics: Arc<Vec<Arc<Mutex<WorkerMetrics>>>> = Arc::new(
+            (0..self.num_threads)
+                .map(|_| Arc::new(Mutex::new(WorkerMetrics::default())))
+                .collect(),
+        );
 
         let on_block = {
+            let worker_metrics = worker_metrics.clone();
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let slot_buffer = slot_buffer.clone();
             let slots_since_flush = slots_since_flush.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, block: BlockData| {
+                let worker_metrics = worker_metrics[thread_id].clone();
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let slot_buffer = slot_buffer.clone();
@@ -381,7 +389,11 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    metrics::note_thread_activity(thread_id);
+                    let (transactions, tally) = worker_metrics
+                        .lock()
+                        .expect("worker metrics poisoned")
+                        .finish_block(block.slot());
+                    metrics::note_thread_transactions(thread_id, transactions);
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
                             target: &log_target,
@@ -451,7 +463,6 @@ impl PluginRunner {
                                 block_time,
                                 ..
                             } => {
-                                let tally = take_slot_tx_tally(*slot);
                                 let slot = *slot;
                                 let executed_transaction_count = *executed_transaction_count;
                                 let block_time = *block_time;
@@ -470,10 +481,7 @@ impl PluginRunner {
                                     .await;
                                 });
                             }
-                            BlockData::PossibleLeaderSkipped { slot } => {
-                                // Drop any tallies that may exist for skipped slots.
-                                take_slot_tx_tally(*slot);
-                            }
+                            BlockData::PossibleLeaderSkipped { .. } => {}
                         }
                     }
                     Ok(())
@@ -483,17 +491,21 @@ impl PluginRunner {
         };
 
         let on_transaction = {
+            let worker_metrics = worker_metrics.clone();
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, transaction: TransactionData| {
+                let worker_metrics = worker_metrics[thread_id].clone();
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    metrics::note_thread_transaction(thread_id);
-                    record_slot_vote_tally(transaction.slot, transaction.is_vote);
+                    worker_metrics
+                        .lock()
+                        .expect("worker metrics poisoned")
+                        .record_transaction(transaction.slot, transaction.is_vote);
                     if plugin_handles.is_empty() {
                         return Ok(());
                     }
@@ -837,6 +849,17 @@ impl PluginRunner {
             }
         };
 
+        // Preserve metrics for a partial block on shutdown or a terminal error.
+        for (thread_id, worker) in worker_metrics.iter().enumerate() {
+            let transactions = worker
+                .lock()
+                .expect("worker metrics poisoned")
+                .take_transactions();
+            if transactions != 0 {
+                metrics::note_thread_transactions(thread_id, transactions);
+            }
+        }
+
         // Drain outstanding fire-and-forget writes (including any parked in retry backoff)
         // before flushing final state; past this point runtime teardown and the embedded
         // ClickHouse shutdown cannot cancel a delivery.
@@ -1019,14 +1042,144 @@ struct SlotStatusRow {
     block_time: u32,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct SlotTxTally {
     votes: u64,
     non_votes: u64,
 }
 
-static SLOT_TX_TALLY: Lazy<DashMap<u64, SlotTxTally, ahash::RandomState>> =
-    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+/// Transaction callbacks for a worker are serial, but may run on different OS
+/// threads. Keep counters under that worker's own lock instead of shared maps.
+#[derive(Default)]
+#[repr(align(128))]
+struct WorkerMetrics {
+    transactions: u64,
+    slot: Option<u64>,
+    tally: SlotTxTally,
+}
+
+#[cfg(test)]
+mod worker_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_slots_do_not_consume_current_block_tallies() {
+        let mut metrics = WorkerMetrics::default();
+        metrics.record_transaction(100, true);
+        metrics.record_transaction(100, false);
+        metrics.record_transaction(100, false);
+        assert_eq!(metrics.finish_block(99), (3, SlotTxTally::default()));
+        assert_eq!(
+            metrics.finish_block(100),
+            (
+                0,
+                SlotTxTally {
+                    votes: 1,
+                    non_votes: 2
+                }
+            )
+        );
+        assert_eq!(metrics.finish_block(100), (0, SlotTxTally::default()));
+    }
+
+    #[test]
+    fn partial_blocks_are_counted_at_shutdown_without_double_counting() {
+        let mut metrics = WorkerMetrics::default();
+        metrics.record_transaction(10, true);
+        assert_eq!(metrics.finish_block(10).0, 1);
+        metrics.record_transaction(11, false);
+        assert_eq!(metrics.take_transactions(), 1);
+        assert_eq!(metrics.take_transactions(), 0);
+        let fresh_run = WorkerMetrics::default();
+        assert_eq!(fresh_run.transactions, 0);
+        assert_eq!(fresh_run.tally, SlotTxTally::default());
+    }
+
+    #[test]
+    fn slot_transitions_discard_stale_tallies_but_preserve_processed_count() {
+        let mut metrics = WorkerMetrics::default();
+        metrics.record_transaction(200, true);
+        metrics.record_transaction(100, false); // Reverse replay / new assignment.
+        assert_eq!(
+            metrics.finish_block(100),
+            (
+                2,
+                SlotTxTally {
+                    votes: 0,
+                    non_votes: 1
+                }
+            )
+        );
+        assert_eq!(metrics.finish_block(200), (0, SlotTxTally::default()));
+    }
+
+    #[test]
+    fn concurrent_workers_have_independent_counts_and_tallies() {
+        let workers: Arc<Vec<Mutex<WorkerMetrics>>> = Arc::new(
+            (0..8)
+                .map(|_| Mutex::new(WorkerMetrics::default()))
+                .collect(),
+        );
+        let threads = (0..8)
+            .map(|id| {
+                let workers = workers.clone();
+                std::thread::spawn(move || {
+                    for tx in 0..1000 {
+                        workers[id]
+                            .lock()
+                            .unwrap()
+                            .record_transaction(42, tx % 2 == 0);
+                    }
+                    workers[id].lock().unwrap().finish_block(42)
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert_eq!(
+                thread.join().unwrap(),
+                (
+                    1000,
+                    SlotTxTally {
+                        votes: 500,
+                        non_votes: 500
+                    }
+                )
+            );
+        }
+    }
+}
+
+impl WorkerMetrics {
+    fn record_transaction(&mut self, slot: u64, is_vote: bool) {
+        self.transactions = self.transactions.saturating_add(1);
+        if self.slot != Some(slot) {
+            // A new slot supersedes a partial block left by a failed attempt.
+            self.slot = Some(slot);
+            self.tally = SlotTxTally::default();
+        }
+        if is_vote {
+            self.tally.votes = self.tally.votes.saturating_add(1);
+        } else {
+            self.tally.non_votes = self.tally.non_votes.saturating_add(1);
+        }
+    }
+
+    fn take_transactions(&mut self) -> u64 {
+        std::mem::take(&mut self.transactions)
+    }
+
+    fn finish_block(&mut self, slot: u64) -> (u64, SlotTxTally) {
+        let tally = if self.slot == Some(slot) {
+            self.slot = None;
+            std::mem::take(&mut self.tally)
+        } else {
+            // Skipped-slot callbacks can precede the current block's callback
+            // after its transactions have already been delivered.
+            SlotTxTally::default()
+        };
+        (self.take_transactions(), tally)
+    }
+}
 
 async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
     db.query(
@@ -1306,22 +1459,6 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
         Some(ts) if ts < 0 => 0,
         _ => 0,
     }
-}
-
-fn record_slot_vote_tally(slot: u64, is_vote: bool) {
-    let mut entry = SLOT_TX_TALLY.entry(slot).or_default();
-    if is_vote {
-        entry.votes = entry.votes.saturating_add(1);
-    } else {
-        entry.non_votes = entry.non_votes.saturating_add(1);
-    }
-}
-
-fn take_slot_tx_tally(slot: u64) -> SlotTxTally {
-    SLOT_TX_TALLY
-        .remove(&slot)
-        .map(|(_, tally)| tally)
-        .unwrap_or_default()
 }
 
 // Ensure PluginRunnerError is Send + Sync + 'static

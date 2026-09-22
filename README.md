@@ -542,6 +542,10 @@ Add `--tui` to render a live terminal dashboard instead of plain log output:
 Pane dividers are mouse-draggable. Press `q`, `Esc`, or `Ctrl-C` for the same graceful
 shutdown as SIGINT; the final log lines are replayed to the terminal on exit.
 
+Transaction counters are accumulated per worker and published at block boundaries to
+reduce contention. Per-thread TPS/activity displays therefore update at block granularity;
+partial transaction counts are also published when the run shuts down or a worker exits.
+
 ### Throughput management
 
 The threaded firehose actively manages its connection fleet to cope with CDN throttling:
