@@ -57,7 +57,7 @@ impl Transaction {
             index: None,
         };
 
-        if let serde_cbor::Value::Array(array) = val {
+        if let serde_cbor::Value::Array(mut array) = val {
             // println!("Kind: {:?}", array[0]);
             if let Some(serde_cbor::Value::Integer(kind)) = array.first() {
                 // println!("Kind: {:?}", Kind::from_u64(kind as u64).unwrap().to_string());
@@ -72,13 +72,14 @@ impl Transaction {
                 }
             }
 
-            if let Some(serde_cbor::Value::Array(data)) = &array.get(1) {
-                transaction.data = DataFrame::from_cbor(serde_cbor::Value::Array(data.clone()))?;
+            if let Some(serde_cbor::Value::Array(data)) = array.get_mut(1) {
+                transaction.data =
+                    DataFrame::from_cbor(serde_cbor::Value::Array(std::mem::take(data)))?;
             }
 
-            if let Some(serde_cbor::Value::Array(metadata)) = &array.get(2) {
+            if let Some(serde_cbor::Value::Array(metadata)) = array.get_mut(2) {
                 transaction.metadata =
-                    DataFrame::from_cbor(serde_cbor::Value::Array(metadata.clone()))?;
+                    DataFrame::from_cbor(serde_cbor::Value::Array(std::mem::take(metadata)))?;
             }
 
             if let Some(serde_cbor::Value::Integer(slot)) = array.get(3) {
@@ -141,6 +142,30 @@ pub fn wincode_serialized_size(
 #[cfg(test)]
 mod transaction_tests {
     use {super::*, cid::Cid};
+
+    #[test]
+    fn cbor_payloads_are_moved_into_transaction_without_copying() {
+        use serde_cbor::Value::{Array, Bytes, Integer, Null};
+        let data = vec![1, 2, 3];
+        let metadata = vec![4, 5, 6];
+        let data_ptr = data.as_ptr();
+        let metadata_ptr = metadata.as_ptr();
+        let frame = |bytes| Array(vec![Integer(6), Null, Null, Null, Bytes(bytes)]);
+        let transaction = Transaction::from_cbor(Array(vec![
+            Integer(0),
+            frame(data),
+            frame(metadata),
+            Integer(42),
+            Integer(7),
+        ]))
+        .unwrap();
+        assert_eq!(transaction.data.data.as_slice(), &[1, 2, 3]);
+        assert_eq!(transaction.metadata.data.as_slice(), &[4, 5, 6]);
+        assert_eq!(transaction.data.data.as_slice().as_ptr(), data_ptr);
+        assert_eq!(transaction.metadata.data.as_slice().as_ptr(), metadata_ptr);
+        assert_eq!(transaction.slot, 42);
+        assert_eq!(transaction.index, Some(7));
+    }
 
     #[test]
     fn native_wincode_roundtrips_v1_transaction() {

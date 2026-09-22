@@ -48,7 +48,7 @@ impl DataFrame {
             next: None,
         };
 
-        if let serde_cbor::Value::Array(array) = val {
+        if let serde_cbor::Value::Array(mut array) = val {
             // println!("Kind: {:?}", array[0]);
             if let Some(serde_cbor::Value::Integer(kind)) = array.first() {
                 // println!("Kind: {:?}", Kind::from_u64(kind as u64).unwrap().to_string());
@@ -71,8 +71,8 @@ impl DataFrame {
             if let Some(serde_cbor::Value::Integer(total)) = array.get(3) {
                 data_frame.total = Some(*total as u64);
             }
-            if let Some(serde_cbor::Value::Bytes(data)) = &array.get(4) {
-                data_frame.data = Buffer::from_vec(data.clone());
+            if let Some(serde_cbor::Value::Bytes(data)) = array.get_mut(4) {
+                data_frame.data = Buffer::from_vec(std::mem::take(data));
             }
 
             if array.len() > 5

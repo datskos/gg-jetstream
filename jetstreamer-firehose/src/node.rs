@@ -297,69 +297,57 @@ impl Node {
     }
 }
 
-// parse_any_from_cbordata parses any CBOR data into either a Epoch, Subset, Block, Rewards, Entry, or Transaction
 /// Parses the raw CBOR payload into the appropriate [`Node`] variant.
-pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, SharedError> {
-    let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data)?;
-    // Process the decoded data
-    // println!("Data: {:?}", decoded_data);
-    let cloned_data = decoded_data.clone();
+/// Borrows the encoded bytes and moves the decoded values into the typed node.
+pub fn parse_any_from_cbordata(data: impl AsRef<[u8]>) -> Result<Node, SharedError> {
+    let decoded: serde_cbor::Value = serde_cbor::from_slice(data.as_ref())?;
+    let kind = match &decoded {
+        serde_cbor::Value::Array(array) => match array.first() {
+            Some(serde_cbor::Value::Integer(kind)) => Kind::from_u64(*kind as u64)
+                .ok_or_else(|| std::io::Error::other(format!("Invalid kind: {kind}")))?,
+            _ => return Err(std::io::Error::other("Unknown type").into()),
+        },
+        _ => return Err(std::io::Error::other("Unknown type").into()),
+    };
+    Ok(match kind {
+        Kind::Transaction => Node::Transaction(transaction::Transaction::from_cbor(decoded)?),
+        Kind::Entry => Node::Entry(entry::Entry::from_cbor(decoded)?),
+        Kind::Block => Node::Block(block::Block::from_cbor(decoded)?),
+        Kind::Subset => Node::Subset(subset::Subset::from_cbor(decoded)?),
+        Kind::Epoch => Node::Epoch(epoch::Epoch::from_cbor(decoded)?),
+        Kind::Rewards => Node::Rewards(rewards::Rewards::from_cbor(decoded)?),
+        Kind::DataFrame => Node::DataFrame(dataframe::DataFrame::from_cbor(decoded)?),
+    })
+}
 
-    // decoded_data is an serde_cbor.Array; print the kind, which is the first element of the array
-    if let serde_cbor::Value::Array(array) = decoded_data {
-        // println!("Kind: {:?}", array[0]);
-        if let Some(serde_cbor::Value::Integer(kind)) = array.first() {
-            // println!(
-            //     "Kind: {:?}",
-            //     Kind::from_u64(kind as u64).unwrap().to_string()
-            // );
+#[cfg(test)]
+mod cbor_dispatch_tests {
+    use super::*;
 
-            // based on the kind, we can decode the rest of the data
-            let Some(kind) = Kind::from_u64(*kind as u64) else {
-                return Err(Box::new(std::io::Error::other(std::format!(
-                    "Invalid kind: {:?}",
-                    kind
-                ))));
+    #[test]
+    fn dispatches_all_kinds_from_borrowed_bytes() {
+        for kind in 0..=6 {
+            let bytes = serde_cbor::to_vec(&vec![kind]).unwrap();
+            let node = parse_any_from_cbordata(bytes.as_slice()).unwrap();
+            let actual = match node {
+                Node::Transaction(_) => 0,
+                Node::Entry(_) => 1,
+                Node::Block(_) => 2,
+                Node::Subset(_) => 3,
+                Node::Epoch(_) => 4,
+                Node::Rewards(_) => 5,
+                Node::DataFrame(_) => 6,
             };
-            match kind {
-                Kind::Transaction => {
-                    let transaction = transaction::Transaction::from_cbor(cloned_data)?;
-                    return Ok(Node::Transaction(transaction));
-                }
-                Kind::Entry => {
-                    let entry = entry::Entry::from_cbor(cloned_data)?;
-                    return Ok(Node::Entry(entry));
-                }
-                Kind::Block => {
-                    let block = block::Block::from_cbor(cloned_data)?;
-                    return Ok(Node::Block(block));
-                }
-                Kind::Subset => {
-                    let subset = subset::Subset::from_cbor(cloned_data)?;
-                    return Ok(Node::Subset(subset));
-                }
-                Kind::Epoch => {
-                    let epoch = epoch::Epoch::from_cbor(cloned_data)?;
-                    return Ok(Node::Epoch(epoch));
-                }
-                Kind::Rewards => {
-                    let rewards = rewards::Rewards::from_cbor(cloned_data)?;
-                    return Ok(Node::Rewards(rewards));
-                }
-                Kind::DataFrame => {
-                    let dataframe = dataframe::DataFrame::from_cbor(cloned_data)?;
-                    return Ok(Node::DataFrame(dataframe));
-                } // unknown => {
-                  //     return Err(Box::new(std::io::Error::new(
-                  //         std::io::ErrorKind::Other,
-                  //         std::format!("Unknown type: {:?}", unknown),
-                  //     )))
-                  // }
-            }
+            assert_eq!(actual, kind);
         }
     }
 
-    Err(Box::new(std::io::Error::other("Unknown type".to_owned())))
+    #[test]
+    fn rejects_malformed_cbor_and_unknown_kinds() {
+        for bytes in [vec![0xff], vec![0x80], vec![0x01], vec![0x81, 0x07]] {
+            assert!(parse_any_from_cbordata(&bytes).is_err());
+        }
+    }
 }
 
 /// Numeric discriminant used in the CBOR encoding of [`Node`] variants.
@@ -456,7 +444,7 @@ impl RawNode {
 
     /// Parses the node into a typed [`Node`].
     pub fn parse(&self) -> Result<Node, SharedError> {
-        let parsed = parse_any_from_cbordata(self.data.clone());
+        let parsed = parse_any_from_cbordata(&self.data);
         match parsed {
             Ok(node) => Ok(node),
             Err(_) => Err(Box::new(std::io::Error::other("Unknown type".to_owned()))),

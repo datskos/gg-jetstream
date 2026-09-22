@@ -87,7 +87,7 @@ impl RawNode {
 
     /// Parses the CBOR payload into a typed [`Node`].
     pub fn parse(&self) -> Result<Node, SharedError> {
-        match parse_any_from_cbordata(self.data.clone()) {
+        match parse_any_from_cbordata(&self.data) {
             Ok(node) => Ok(node),
             Err(err) => {
                 println!("Error: {:?}", err);

@@ -42,7 +42,7 @@ impl Rewards {
             },
         };
 
-        if let serde_cbor::Value::Array(array) = val {
+        if let serde_cbor::Value::Array(mut array) = val {
             // println!("Kind: {:?}", array[0]);
             if let Some(serde_cbor::Value::Integer(kind)) = array.first() {
                 // println!("Kind: {:?}", Kind::from_u64(kind as u64).unwrap().to_string());
@@ -60,9 +60,10 @@ impl Rewards {
                 rewards.slot = *slot as u64;
             }
 
-            if let Some(serde_cbor::Value::Array(data)) = &array.get(2) {
-                rewards.data =
-                    dataframe::DataFrame::from_cbor(serde_cbor::Value::Array(data.clone()))?;
+            if let Some(serde_cbor::Value::Array(data)) = array.get_mut(2) {
+                rewards.data = dataframe::DataFrame::from_cbor(serde_cbor::Value::Array(
+                    std::mem::take(data),
+                ))?;
             }
         }
         Ok(rewards)

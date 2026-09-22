@@ -44,7 +44,7 @@ impl Entry {
             transactions: vec![],
         };
 
-        if let serde_cbor::Value::Array(array) = val {
+        if let serde_cbor::Value::Array(mut array) = val {
             // println!("Kind: {:?}", array[0]);
             if let Some(serde_cbor::Value::Integer(kind)) = array.first() {
                 // println!("Kind: {:?}", Kind::from_u64(kind as u64).unwrap().to_string());
@@ -61,8 +61,8 @@ impl Entry {
             if let Some(serde_cbor::Value::Integer(num_hashes)) = array.get(1) {
                 entry.num_hashes = *num_hashes as u64;
             }
-            if let Some(serde_cbor::Value::Bytes(hash)) = &array.get(2) {
-                entry.hash = Hash(hash.to_vec());
+            if let Some(serde_cbor::Value::Bytes(hash)) = array.get_mut(2) {
+                entry.hash = Hash(std::mem::take(hash));
             }
 
             if let Some(serde_cbor::Value::Array(transactions)) = &array.get(3) {
