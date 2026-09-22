@@ -895,20 +895,19 @@ fn clear_pending_skip(
 fn decode_transaction_status_meta_from_frame(
     slot: u64,
     reassembled_metadata: Vec<u8>,
+    decoder: &mut utils::ZstdDecoder,
 ) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
     if reassembled_metadata.is_empty() {
         // Early epochs often omit metadata entirely.
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match utils::decompress_zstd(reassembled_metadata.as_slice()) {
-        Ok(decompressed) => {
-            decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
-                Box::new(std::io::Error::other(format!(
-                    "decode transaction metadata (slot {slot}): {err}"
-                ))) as SharedError
-            })
-        }
+    match decoder.decompress(reassembled_metadata.as_slice()) {
+        Ok(decompressed) => decode_transaction_status_meta(slot, decompressed).map_err(|err| {
+            Box::new(std::io::Error::other(format!(
+                "decode transaction metadata (slot {slot}): {err}"
+            ))) as SharedError
+        }),
         Err(decomp_err) => {
             // If the frame was not zstd-compressed (common for very early data), try to
             // decode the raw bytes directly before bailing.
@@ -939,14 +938,15 @@ impl DecodedRewards {
 fn decode_rewards_from_frame(
     slot: u64,
     reassembled_rewards: Vec<u8>,
+    decoder: &mut utils::ZstdDecoder,
 ) -> Result<DecodedRewards, SharedError> {
     if reassembled_rewards.is_empty() {
         // Early epochs sometimes omit rewards payloads entirely.
         return Ok(DecodedRewards::empty());
     }
 
-    match utils::decompress_zstd(reassembled_rewards.as_slice()) {
-        Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed.as_slice()).map_err(
+    match decoder.decompress(reassembled_rewards.as_slice()) {
+        Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed).map_err(
             |err| {
                 Box::new(std::io::Error::other(format!(
                     "decode rewards (slot {slot}): {err}"
@@ -1102,6 +1102,25 @@ mod metadata_decode_tests {
     }
 
     #[test]
+    fn reuses_decoder_across_compressed_and_raw_metadata() {
+        let mut decoder = crate::utils::ZstdDecoder::default();
+        for fee in [42, 99, 100] {
+            let mut meta = sample_meta();
+            meta.fee = fee;
+            let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
+                meta.clone().into();
+            let raw = prost::Message::encode_to_vec(&proto);
+            let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
+            for frame in [compressed, raw] {
+                let decoded =
+                    decode_transaction_status_meta_from_frame(157 * 432000, frame, &mut decoder)
+                        .unwrap();
+                assert_eq!(decoded, meta);
+            }
+        }
+    }
+
+    #[test]
     fn falls_back_to_proto_when_early_epoch_bytes_are_proto() {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
@@ -1114,7 +1133,12 @@ mod metadata_decode_tests {
 
     #[test]
     fn empty_frame_decodes_to_default() {
-        let decoded = decode_transaction_status_meta_from_frame(0, Vec::new()).expect("decode");
+        let decoded = decode_transaction_status_meta_from_frame(
+            0,
+            Vec::new(),
+            &mut crate::utils::ZstdDecoder::default(),
+        )
+        .expect("decode");
         assert_eq!(decoded, TransactionStatusMeta::default());
     }
 
@@ -1135,8 +1159,12 @@ mod metadata_decode_tests {
             cost_units: None,
         };
         let raw_bytes = bincode::serialize(&stored).expect("serialize");
-        let decoded =
-            decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
+        let decoded = decode_transaction_status_meta_from_frame(
+            0,
+            raw_bytes,
+            &mut crate::utils::ZstdDecoder::default(),
+        )
+        .expect("decode fallback");
         assert_eq!(decoded, TransactionStatusMeta::from(stored));
     }
 }
@@ -1812,6 +1840,7 @@ where
                     };
                     log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
+                    let mut zstd_decoder = utils::ZstdDecoder::default();
                     let mut previous_blockhash = Hash::default();
                     let mut latest_entry_blockhash = Hash::default();
                     // Reset counters to align to the local epoch slice; prevents boundary slots
@@ -2074,6 +2103,7 @@ where
                                         let as_native_metadata = decode_transaction_status_meta_from_frame(
                                             block.slot,
                                             reassembled_metadata,
+                                            &mut zstd_decoder,
                                         )
                                         .map_err(|err| {
                                             (
@@ -2425,7 +2455,7 @@ where
                                         }
 
                                         let decoded_rewards =
-                                            decode_rewards_from_frame(block.slot, reassembled)
+                                            decode_rewards_from_frame(block.slot, reassembled, &mut zstd_decoder)
                                                 .map_err(|err| {
                                                     (
                                                         FirehoseError::NodeDecodingError(
@@ -3176,6 +3206,7 @@ async fn firehose_geyser_thread(
                 };
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
+                let mut zstd_decoder = utils::ZstdDecoder::default();
                 let mut todo_previous_blockhash = Hash::default();
                 let mut todo_latest_entry_blockhash = Hash::default();
                 // Reset counters to align to the local epoch slice; prevents boundary slots
@@ -3379,6 +3410,7 @@ async fn firehose_geyser_thread(
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
                                     reassembled_metadata,
+                                            &mut zstd_decoder,
                                 )?;
 
                                 let message_hash = {
@@ -3487,6 +3519,7 @@ async fn firehose_geyser_thread(
                                     this_block_rewards = decode_rewards_from_frame(
                                         block.slot,
                                         reassembled,
+                                        &mut zstd_decoder,
                                     )?;
                                 } else {
                                     this_block_rewards = DecodedRewards::empty();

@@ -211,8 +211,67 @@ pub const MAX_ALLOWED_SECTION_SIZE: usize = 32 << 20; // 32MiB
 
 /// Decompresses a Zstandard byte stream.
 pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, SharedError> {
-    let mut decoder = zstd::Decoder::new(data)?;
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(decompressed)
+    let mut decoder = ZstdDecoder::default();
+    decoder.decompress(data)?;
+    Ok(decoder.output)
+}
+
+/// Scratch space owned by one firehose worker; no locks or thread-local state.
+/// The output is borrowed until the next frame so decoding need not copy it.
+#[derive(Default)]
+pub(crate) struct ZstdDecoder {
+    context: zstd::zstd_safe::DCtx<'static>,
+    output: Vec<u8>,
+}
+
+impl ZstdDecoder {
+    pub(crate) fn decompress(&mut self, data: &[u8]) -> Result<&[u8], SharedError> {
+        // Reset even after an invalid/truncated frame before reusing the context.
+        self.context
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(|code| io::Error::other(zstd::zstd_safe::get_error_name(code)))?;
+        self.output.clear();
+        // A slice already implements BufRead: do not allocate a BufReader.
+        zstd::Decoder::with_context(data, &mut self.context).read_to_end(&mut self.output)?;
+        Ok(&self.output)
+    }
+}
+
+#[cfg(test)]
+mod zstd_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn reuses_output_allocation_and_clears_previous_frame() {
+        let mut decoder = ZstdDecoder::default();
+        let first = vec![42; 65536];
+        let compressed = zstd::encode_all(first.as_slice(), 1).unwrap();
+        let output = decoder.decompress(&compressed).unwrap();
+        assert_eq!(output, first);
+        let ptr = output.as_ptr();
+        let compressed = zstd::encode_all(&b"short"[..], 1).unwrap();
+        let output = decoder.decompress(&compressed).unwrap();
+        assert_eq!(output, b"short");
+        assert_eq!(output.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn recovers_after_corrupt_and_truncated_frames() {
+        let compressed = zstd::encode_all(&b"hello world"[..], 1).unwrap();
+        let mut decoder = ZstdDecoder::default();
+        for bad in [&b"not zstd"[..], &compressed[..compressed.len() - 1]] {
+            assert!(decoder.decompress(bad).is_err());
+            assert_eq!(decoder.decompress(&compressed).unwrap(), b"hello world");
+        }
+    }
+
+    #[test]
+    fn supports_concatenated_frames_without_content_size() {
+        let mut compressed = zstd::encode_all(&b"hello"[..], 1).unwrap();
+        compressed.extend(zstd::encode_all(&b" world"[..], 1).unwrap());
+        assert_eq!(
+            ZstdDecoder::default().decompress(&compressed).unwrap(),
+            b"hello world"
+        );
+    }
 }
