@@ -875,6 +875,11 @@ impl PluginRunner {
 fn build_clickhouse_client(dsn: &str) -> Client {
     let mut client = Client::default();
     if let Ok(mut url) = Url::parse(dsn) {
+        // The ClickHouse client clears URL query parameters when building requests.
+        // Configure the database explicitly so queries and inserts use the DSN's database.
+        if let Some((_, database)) = url.query_pairs().find(|(key, _)| key == "database") {
+            client = client.with_database(database.into_owned());
+        }
         let username = url.username().to_string();
         let password = url.password().map(|value| value.to_string());
         if !username.is_empty() || password.is_some() {
@@ -892,6 +897,55 @@ fn build_clickhouse_client(dsn: &str) -> Client {
         client = client.with_url(dsn);
     }
     client
+}
+
+#[cfg(test)]
+mod clickhouse_dsn_tests {
+    use super::build_clickhouse_client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn clickhouse_dsn_database_is_sent_in_requests() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0, "connection closed before request headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let client = build_clickhouse_client(&format!(
+                "http://jetstreamer:test-password@{address}/?database=jetstreamer%2Dtest"
+            ));
+            client.query("SELECT 1").execute().await.unwrap();
+            let request = server.await.unwrap();
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| { key == "database" && value == "jetstreamer-test" }),
+                "database missing from request: {target}"
+            );
+        })
+        .await
+        .expect("ClickHouse mock request timed out");
+    }
 }
 
 /// Errors that can arise while running plugins against the firehose.
