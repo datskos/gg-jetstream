@@ -44,6 +44,12 @@ pub(crate) struct TxMetadataRow {
     pub(crate) is_success: bool,
     pub(crate) num_ixs: u16,
     pub(crate) num_ixs_builtin: u16,
+    /// Message-declared writable accounts, including loaded lookup-table keys.
+    pub(crate) num_accounts_rw: u16,
+    /// Message-declared readonly accounts, including loaded lookup-table keys.
+    pub(crate) num_accounts_ro: u16,
+    /// -1 = legacy, 0 = v0, 1 = v1; None is reserved for unrecorded rows.
+    pub(crate) tx_version: Option<i8>,
 }
 
 /// Borrowed message-header values used by the scheduler cost model.
@@ -161,6 +167,23 @@ where
         is_success,
         accounts,
     } = input;
+    // Counts come from the header and resolved lookup lengths, with no account
+    // scan or allocation. These describe requested access, before runtime
+    // demotion of reserved keys or program accounts to readonly.
+    let static_readonly = usize::from(header.num_readonly_signed_accounts)
+        + usize::from(header.num_readonly_unsigned_accounts);
+    let num_accounts_ro = (static_readonly + accounts.loaded_readonly.len()) as u16;
+    let num_accounts_rw = (accounts.static_keys.len().saturating_sub(static_readonly)
+        + accounts.loaded_writable.len()) as u16;
+    // Both source adapters supply Some(config) for every V1 message, even
+    // when all of that message's optional configuration fields are absent.
+    let tx_version = Some(if is_legacy {
+        -1
+    } else if v1_config.is_some() {
+        1
+    } else {
+        0
+    });
     let instructions = instructions.into_iter();
     let scheduler_metrics = scheduler_metrics::calculate(
         num_signatures,
@@ -192,6 +215,9 @@ where
             is_success,
             num_ixs: 1,
             num_ixs_builtin: 1,
+            num_accounts_rw,
+            num_accounts_ro,
+            tx_version,
             ..TxMetadataRow::default()
         };
     }
@@ -241,6 +267,9 @@ where
         is_success,
         num_ixs,
         num_ixs_builtin,
+        num_accounts_rw,
+        num_accounts_ro,
+        tx_version,
     }
 }
 
@@ -433,7 +462,10 @@ pub(crate) async fn ensure_tx_metadata_table(db: &Client) -> Result<(), clickhou
             is_vote          Bool,
             is_success       Bool,
             num_ixs          UInt16,
-            num_ixs_builtin  UInt16
+            num_ixs_builtin  UInt16,
+            num_accounts_rw  UInt16,
+            num_accounts_ro  UInt16,
+            tx_version       Nullable(Int8) DEFAULT NULL COMMENT '-1 = legacy, 0 = v0, 1 = v1; NULL = not recorded'
         )
         ENGINE = ReplacingMergeTree
         PARTITION BY intDiv(slot, 1000000)
@@ -453,6 +485,15 @@ pub(crate) async fn ensure_tx_metadata_table(db: &Client) -> Result<(), clickhou
     .await?;
     db.query(
         "ALTER TABLE tx_meta_v2 ADD COLUMN IF NOT EXISTS scheduler_priority Nullable(UInt64) AFTER scheduler_cost_units",
+    )
+    .execute()
+    .await?;
+
+    db.query(
+        "ALTER TABLE tx_meta_v2
+         ADD COLUMN IF NOT EXISTS num_accounts_rw UInt16 AFTER num_ixs_builtin,
+         ADD COLUMN IF NOT EXISTS num_accounts_ro UInt16 AFTER num_accounts_rw,
+         ADD COLUMN IF NOT EXISTS tx_version Nullable(Int8) DEFAULT NULL COMMENT '-1 = legacy, 0 = v0, 1 = v1; NULL = not recorded' AFTER num_accounts_ro",
     )
     .execute()
     .await?;
@@ -505,6 +546,9 @@ mod tests {
                 "is_success",
                 "num_ixs",
                 "num_ixs_builtin",
+                "num_accounts_rw",
+                "num_accounts_ro",
+                "tx_version",
             ]
         );
     }
@@ -512,6 +556,57 @@ mod tests {
     #[test]
     fn writes_to_the_v2_table() {
         assert_eq!(TX_METADATA_TABLE, "tx_meta_v2");
+    }
+
+    #[test]
+    fn account_counts_and_versions_cover_votes_and_all_message_versions() {
+        for version in [-1, 0, 1] {
+            for is_vote in [false, true] {
+                let program = if is_vote {
+                    solana_sdk_ids::vote::id()
+                } else {
+                    solana_sdk_ids::system_program::id()
+                };
+                let keys = [
+                    Address::new_from_array([1; 32]),
+                    Address::new_from_array([2; 32]),
+                    Address::new_from_array([3; 32]),
+                    program,
+                ];
+                let writable = [Address::new_from_array([4; 32]); 2];
+                let readonly = [Address::new_from_array([5; 32]); 3];
+                let (loaded_rw, loaded_ro): (&[Address], &[Address]) = if version == 0 {
+                    (&writable, &readonly)
+                } else {
+                    (&[], &[])
+                };
+                let row = parse_tx_metadata(
+                    TxMetadataInput {
+                        slot: 42,
+                        tx_idx: 7,
+                        num_signatures: 2,
+                        header: MessageHeaderView {
+                            num_required_signatures: 2,
+                            num_readonly_signed_accounts: 1,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        is_legacy: version == -1,
+                        // V1 is still V1 when it carries no explicit budget options.
+                        v1_config: (version == 1).then(V1TransactionConfigView::default),
+                        fee: 10_000,
+                        compute_units_consumed: Some(100),
+                        is_success: false,
+                        accounts: ResolvedAccounts::new(&keys, loaded_rw, loaded_ro),
+                    },
+                    [ix(3, &[])],
+                );
+                assert_eq!(row.tx_version, Some(version));
+                assert_eq!(row.num_accounts_rw, if version == 0 { 4 } else { 2 });
+                assert_eq!(row.num_accounts_ro, if version == 0 { 5 } else { 2 });
+                assert_eq!(row.is_vote, is_vote);
+                assert!(!row.is_success);
+            }
+        }
     }
 
     #[test]

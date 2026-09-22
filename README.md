@@ -507,6 +507,11 @@ table (with a companion `pubkeys` lookup table populated via materialised view).
 `GhostTransaction` or storing transaction signatures. It also stores Agave's estimated
 `scheduler_cost_units` and reward-per-cost `scheduler_priority`; both are nullable when a
 transaction's scheduler configuration cannot be derived.
+`num_accounts_rw` and `num_accounts_ro` count message-declared writable and readonly
+accounts, including resolved address-table lookups (before runtime writability
+demotion). `tx_version` records `-1` for legacy, `0` for v0, and `1` for v1, including
+vote transactions. Startup adds missing columns to existing tables; historical rows
+retain zero account counts and `NULL` versions until those transactions are replayed.
 
 The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range (`900-950`),
 or an inclusive `<start>:<end>` slot range on the command line. See
