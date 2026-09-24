@@ -335,6 +335,8 @@ impl PluginRunner {
         slot_range: Range<u64>,
         clickhouse_enabled: bool,
     ) -> Result<(), PluginRunnerError> {
+        jetstreamer_firehose::epochs::validate_parallel_download_config()
+            .map_err(PluginRunnerError::Configuration)?;
         let db_update_interval = self.db_update_interval_slots.max(1);
         let plugin_handles: Arc<Vec<PluginHandle>> = Arc::new(
             self.plugins
@@ -910,6 +912,9 @@ mod clickhouse_dsn_tests {
 /// Errors that can arise while running plugins against the firehose.
 #[derive(Debug, Error)]
 pub enum PluginRunnerError {
+    /// Invalid runtime or download configuration.
+    #[error("configuration error: {0}")]
+    Configuration(String),
     /// ClickHouse client returned an error.
     #[error("clickhouse error: {0}")]
     Clickhouse(#[from] clickhouse::error::Error),

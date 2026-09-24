@@ -193,6 +193,7 @@ pub mod network;
 pub mod node;
 /// Reader utilities for decoding Old Faithful CAR node streams.
 pub mod node_reader;
+mod prefetch;
 /// Reward decoding primitives and helpers.
 pub mod rewards;
 /// Utilities for working with subset nodes.

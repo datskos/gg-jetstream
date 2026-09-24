@@ -471,6 +471,36 @@ If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool usin
 hardware-aware heuristic exposed by
 `jetstreamer_firehose::system::optimal_firehose_thread_count`.
 
+Parallel HTTP replay supports background range downloads independently of parsing:
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `JETSTREAMER_DOWNLOAD_CONCURRENCY` | `0` (disabled) | Concurrent range requests per processing worker; set `4` to enable prefetch. |
+| `JETSTREAMER_DOWNLOAD_CHUNK` | `8MiB` | Payload size of each range request. |
+| `JETSTREAMER_DOWNLOAD_BUFFER` | `8GiB` | Shared payload budget across downloading, queued, and currently consumed chunks. |
+| `JETSTREAMER_TOKIO_WORKERS` | Available logical CPUs | Runtime worker threads, independent of `JETSTREAMER_THREADS`. |
+
+For a large machine, start with 64 processing workers and four downloads per worker
+(up to 256 range requests). Downloads continue while parsing consumes earlier chunks;
+responses are delivered in archive order. Seeking and closing a reader cancel pending
+downloads. The payload budget is not a total process memory limit: decoded blocks,
+plugins, and HTTP/socket buffers consume additional memory.
+
+```bash
+JETSTREAMER_THREADS=64 \
+JETSTREAMER_TOKIO_WORKERS=128 \
+JETSTREAMER_DOWNLOAD_CONCURRENCY=4 \
+JETSTREAMER_DOWNLOAD_CHUNK=8MiB \
+JETSTREAMER_DOWNLOAD_BUFFER=8GiB \
+JETSTREAMER_CLICKHOUSE_MODE=off \
+./jetstreamer 1035 --with-plugin tx-metadata --tui
+```
+
+This is a starting point for measuring throughput, not a guarantee of network saturation.
+Set download concurrency to `0` to compare against the original demand-read path.
+These download options apply to parallel HTTP replay, not S3 or sequential replay.
+The sequential `--buffer-window` option below is separate.
+
 The `tx-metadata` plugin combines completed blocks across workers into ClickHouse inserts
 of roughly 50,000 rows (whole blocks are kept together). Each block callback also flushes
 an existing batch if it is at least one second old; this is an arrival-driven check, not a
@@ -739,6 +769,19 @@ Epochs at or above 157 are compatible with the current Geyser plugin interface, 
 unit accounting first appears at epoch 450. Plan replay windows accordingly.
 
 ## Installation and Setup
+
+For Intel Xeon Granite Rapids, use the CPU-specific build alias:
+
+```bash
+cargo maxperf -p jetstreamer
+```
+
+The binary is written to `target/x86_64-unknown-linux-gnu/maxperf/jetstreamer`. This profile
+inherits the release optimizations (optimization level 3, LTO, and one codegen unit) and the alias sets Rust's
+`target-cpu=graniterapids`. The explicit target keeps build scripts and proc macros compiled
+for the build host, so they can execute on non-Granite Rapids machines.
+Deploy this build on compatible CPUs; use `cargo build --release`
+for the default CPU target.
 
 ### Nix (Recommended)
 

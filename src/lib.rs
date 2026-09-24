@@ -149,11 +149,23 @@ use jetstreamer_plugin::{
 };
 use std::sync::Arc;
 
-const WORKER_THREAD_MULTIPLIER: usize = 4; // tokio workers per firehose thread
-/// Extra tokio workers beyond the firehose threads, reserved headroom for auxiliary tasks
-/// (recycle monitor, launch gate, signal handling, stats, ClickHouse inserts) so they are
-/// not queued behind streaming work when the CPU is saturated.
-const AUX_WORKER_THREADS: usize = 4;
+fn runtime_worker_count(
+    value: Option<&str>,
+    available_cpus: usize,
+) -> Result<usize, PluginRunnerError> {
+    match value {
+        None => Ok(available_cpus.max(1)),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                PluginRunnerError::Configuration(
+                    "JETSTREAMER_TOKIO_WORKERS must be a positive integer".into(),
+                )
+            }),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {
@@ -485,8 +497,14 @@ impl JetstreamerRunner {
             && self.config.spawn_clickhouse
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
-        let worker_threads =
-            std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER)) + AUX_WORKER_THREADS;
+        jetstreamer_firehose::epochs::validate_parallel_download_config()
+            .map_err(PluginRunnerError::Configuration)?;
+        let worker_threads = runtime_worker_count(
+            std::env::var("JETSTREAMER_TOKIO_WORKERS").ok().as_deref(),
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        )?;
         log::info!(
             "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
@@ -965,6 +983,16 @@ fn should_spawn_for_dsn(dsn: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_workers_are_independent_and_validated() {
+        assert_eq!(runtime_worker_count(None, 380).unwrap(), 380);
+        assert_eq!(runtime_worker_count(None, 0).unwrap(), 1);
+        assert_eq!(runtime_worker_count(Some("128"), 380).unwrap(), 128);
+        for value in ["0", "-1", "", "abc"] {
+            assert!(runtime_worker_count(Some(value), 380).is_err());
+        }
+    }
 
     #[test]
     fn builtin_plugin_name_flag_roundtrip() {

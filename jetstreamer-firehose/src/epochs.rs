@@ -93,6 +93,35 @@ impl Len for EpochStream {
 
 impl Unpin for EpochStream {}
 
+// Surface initialization errors through the normal reader/retry path instead
+// of panicking a worker or silently switching download modes.
+struct FailedReader(String);
+impl Len for FailedReader {
+    fn len(&self) -> u64 {
+        0
+    }
+}
+impl AsyncRead for FailedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Err(io::Error::other(self.0.clone())))
+    }
+}
+impl AsyncSeek for FailedReader {
+    fn start_seek(self: Pin<&mut Self>, _: SeekFrom) -> io::Result<()> {
+        Err(io::Error::other(self.0.clone()))
+    }
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        std::task::Poll::Ready(Err(io::Error::other(self.0.clone())))
+    }
+}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /*  Blanket Len impl so BufReader<T> keeps the .len() we rely on            */
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -244,6 +273,11 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
     fetch_epoch_stream_with_options(epoch, client, None).await
 }
 
+/// Validates the process-wide HTTP range prefetch environment options.
+pub fn validate_parallel_download_config() -> Result<(), String> {
+    crate::prefetch::settings().map(|_| ())
+}
+
 /// Fetches an epoch’s CAR file with explicit stream options.
 ///
 /// In sequential mode, arbitrary seeking is not supported and seek requests other than
@@ -263,6 +297,24 @@ pub async fn fetch_epoch_stream_with_options(
             .join(&path)
             .unwrap_or_else(|err| panic!("invalid CAR URL for epoch {epoch}: {err}"));
         let request_url = url.to_string();
+        if !options.sequential {
+            match crate::prefetch::settings() {
+                Ok(Some(config)) => {
+                    return match crate::prefetch::RangeReader::open(
+                        client.clone(),
+                        request_url,
+                        config,
+                    )
+                    .await
+                    {
+                        Ok(reader) => EpochStream::new(reader),
+                        Err(err) => EpochStream::new(FailedReader(err.to_string())),
+                    };
+                }
+                Ok(None) => {}
+                Err(err) => return EpochStream::new(FailedReader(err)),
+            }
+        }
         if options.sequential {
             match RipgetEpochReader::new(
                 request_url.clone(),
